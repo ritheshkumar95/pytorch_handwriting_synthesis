@@ -9,7 +9,7 @@ class HandwritingSynthDataset(torch.utils.data.Dataset):
     def __init__(
         self, hdf5_path
     ):
-        hdf5_path = Path(hdf5_path / 'data.hdf5')
+        hdf5_path = Path(hdf5_path) / 'data.hdf5'
         self.h5 = h5py.File(hdf5_path, 'r')
         self.vocab = eval(self.h5.attrs['vocab'])
         self.char2idx = eval(self.h5.attrs['char2idx'])
@@ -25,6 +25,8 @@ class HandwritingSynthDataset(torch.utils.data.Dataset):
             for x in [chars, chars_mask, strokes, strokes_mask]
         ]
 
+        assert chars.min() >= 0
+        assert chars.max() <= 82
         return chars, chars_mask, strokes, strokes_mask
 
     def __len__(self):
@@ -32,9 +34,9 @@ class HandwritingSynthDataset(torch.utils.data.Dataset):
 
 
 if __name__ == '__main__':
-    path = '/data/pytorch_handwriting_synthesis/data.hdf5'
+    path = '/Tmp/kumarrit/iam_ondb'
     dataset = HandwritingSynthDataset(path)
-    loader = DataLoader(dataset, batch_size=64, num_workers=2)
+    loader = DataLoader(dataset, batch_size=64, num_workers=0)
     for i, data in tqdm(enumerate(loader)):
         if i == 0:
             for x in data:

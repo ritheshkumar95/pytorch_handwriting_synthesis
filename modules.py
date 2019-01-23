@@ -6,6 +6,18 @@ from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 from torch.distributions.distribution import Distribution
 
 
+def weights_init(m):
+    classname = m.__class__.__name__
+    # if classname.find('Linear') != -1:
+    #     nn.init.xavier_normal_(m.weight.data)
+    #     m.bias.data.zero_()
+    # elif classname.find('LSTMCell') != -1:
+    #     nn.init.xavier_normal_(m.weight_ih.data)
+    #     nn.init.xavier_normal_(m.weight_hh.data)
+    #     m.bias_ih.data.zero_()
+    #     m.bias_hh.data.zero_()
+
+
 class MixtureOfBivariateNormal(Distribution):
     def __init__(self, log_pi, mu, sigma, rho):
         '''
@@ -22,11 +34,12 @@ class MixtureOfBivariateNormal(Distribution):
         self.rho = rho
 
     def log_prob(self, x):
-        t = (x - self.mu) / self.sigma
+        eps = 1e-6
+        t = (x - self.mu) / (self.sigma + eps)
         Z = (t ** 2).sum(-1) - 2 * self.rho * torch.prod(t, -1)
 
         num = -Z / (2 * (1 - self.rho ** 2))
-        denom = np.log(2 * np.pi) + torch.log(self.sigma).sum(-1) + .5 * torch.log(1 - self.rho ** 2)
+        denom = np.log(2 * np.pi) + torch.log(self.sigma + eps).sum(-1) + .5 * torch.log(1 - self.rho ** 2)
         log_N = num - denom
         log_prob = torch.logsumexp(self.log_pi + log_N, dim=-1)
         return log_prob
@@ -96,11 +109,12 @@ class GaussianAttention(nn.Module):
 
     def forward(self, h_t, k_tm1, ctx):
         B, T, _ = ctx.shape
+        device = ctx.device
 
         alpha, beta, kappa = torch.exp(self.linear(h_t))[:, None].chunk(3, dim=-1)  # (B, 1, K) each
         kappa += k_tm1
 
-        u = torch.arange(T, dtype=torch.float32).cuda()
+        u = torch.arange(T, dtype=torch.float32).to(device)
         u = u[None, :, None].repeat(B, 1, 1)  # (B, T, 1)
         phi = alpha * torch.exp(-beta * (kappa - u) ** 2)  # (B, T, K)
         phi = phi.sum(-1, keepdim=True)
@@ -125,9 +139,9 @@ class RNNDecoder(nn.Module):
         self.output = nn.Linear(
             hidden_size * n_layers, n_mixtures_output * 6 + 1
         )
-        self.h_0 = nn.Parameter(torch.zeros(n_layers, hidden_size))
-        self.c_0 = nn.Parameter(torch.zeros(n_layers, hidden_size))
-        self.w_0 = nn.Parameter(torch.zeros(enc_size))
+        self.h_0 = nn.Parameter(torch.randn(n_layers, hidden_size))
+        self.c_0 = nn.Parameter(torch.randn(n_layers, hidden_size))
+        self.w_0 = nn.Parameter(torch.randn(enc_size))
         self.k_0 = nn.Parameter(torch.zeros(n_mixtures_attention))
 
     def forward(self, strokes, context, prev_states=None):
@@ -176,12 +190,14 @@ class Seq2Seq(nn.Module):
         )
         self.n_mixtures_attention = n_mixtures_attention
         self.n_mixtures_output = n_mixtures_output
+        self.apply(weights_init)
 
-    def forward(self, strokes, chars, chars_mask):
+    def forward(self, strokes, chars, chars_mask, noise=.1):
         K = self.n_mixtures_output
+        strokes_tf = strokes + torch.randn_like(strokes) * noise
 
         ctx = self.enc(chars, chars_mask) * chars_mask.unsqueeze(-1)
-        out = self.dec(strokes, ctx)[0]
+        out = self.dec(strokes_tf, ctx)[0]
 
         mu, sigma, pi, rho, eos = out.split([2 * K, 2 * K, K, K, 1], -1)
 

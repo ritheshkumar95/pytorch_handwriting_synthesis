@@ -98,10 +98,10 @@ def draw(
 
     ax.set_aspect('equal')
     ax.tick_params(
-        axis='both', left='off', right='off',
-        top='off', bottom='off',
-        labelleft='off', labeltop='off',
-        labelright='off', labelbottom='off'
+        axis='both', left=False, right=False,
+        top=False, bottom=False,
+        labelleft=False, labeltop=False,
+        labelright=False, labelbottom=False
     )
 
     if ascii_seq is not None:
@@ -111,6 +111,6 @@ def draw(
 
     if save_file is not None:
         plt.savefig(save_file)
-        print('saved to {}'.format(save_file))
+        # print('saved to {}'.format(save_file))
 
     return fig
