@@ -2,12 +2,14 @@ import h5py
 import torch
 from tqdm import tqdm
 from torch.utils.data import DataLoader
+from pathlib import Path
 
 
 class HandwritingSynthDataset(torch.utils.data.Dataset):
     def __init__(
         self, hdf5_path
     ):
+        hdf5_path = Path(hdf5_path / 'data.hdf5')
         self.h5 = h5py.File(hdf5_path, 'r')
         self.vocab = eval(self.h5.attrs['vocab'])
         self.char2idx = eval(self.h5.attrs['char2idx'])

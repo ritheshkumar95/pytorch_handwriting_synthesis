@@ -84,20 +84,20 @@ def draw(
         if eos == 1:
             xs, ys = zip(*stroke)
             ys = np.array(ys) * -1
-            ax.plot(xs, ys, 'k')
+            ax.plot(xs, ys, 'k', c='blue')
             stroke = []
 
     if stroke:
         xs, ys = zip(*stroke)
         ys = np.array(ys) * -1
-        ax.plot(xs, ys, 'k')
+        ax.plot(xs, ys, 'k', c='blue')
         stroke = []
 
     ax.set_xlim(-50, 600)
     ax.set_ylim(-40, 40)
 
     ax.set_aspect('equal')
-    plt.tick_params(
+    ax.tick_params(
         axis='both', left='off', right='off',
         top='off', bottom='off',
         labelleft='off', labeltop='off',
@@ -112,6 +112,5 @@ def draw(
     if save_file is not None:
         plt.savefig(save_file)
         print('saved to {}'.format(save_file))
-    else:
-        plt.show()
-    plt.close('all')
+
+    return fig
