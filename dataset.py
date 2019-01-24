@@ -15,19 +15,12 @@ class HandwritingSynthDataset(torch.utils.data.Dataset):
         self.char2idx = eval(self.h5.attrs['char2idx'])
 
     def __getitem__(self, index):
-        chars = self.h5['chars'][index]
-        chars_mask = self.h5['chars_mask'][index]
-        strokes = self.h5['strokes'][index]
-        strokes_mask = self.h5['strokes_mask'][index]
+        strokes = self.h5['strokes'][index][:60]
+        strokes_mask = self.h5['strokes_mask'][index][:60]
 
-        chars, chars_mask, strokes, strokes_mask = [
-            torch.from_numpy(x)
-            for x in [chars, chars_mask, strokes, strokes_mask]
-        ]
-
-        assert chars.min() >= 0
-        assert chars.max() <= 82
-        return chars, chars_mask, strokes, strokes_mask
+        strokes = torch.from_numpy(strokes)
+        strokes_mask = torch.from_numpy(strokes_mask)
+        return strokes, strokes_mask
 
     def __len__(self):
         return len(self.h5['sentences'])

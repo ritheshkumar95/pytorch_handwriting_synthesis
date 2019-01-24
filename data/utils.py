@@ -93,7 +93,8 @@ def draw(
         ax.plot(xs, ys, 'k', c='blue')
         stroke = []
 
-    ax.set_xlim(-50, 600)
+    # ax.set_xlim(-50, 600)
+    ax.set_xlim(-50, 120)
     ax.set_ylim(-40, 40)
 
     ax.set_aspect('equal')
