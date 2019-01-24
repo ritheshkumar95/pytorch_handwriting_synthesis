@@ -7,7 +7,7 @@ from torch.distributions.distribution import Distribution
 
 
 class MixtureOfBivariateNormal(Distribution):
-    def __init__(self, log_pi, mu, sigma, rho):
+    def __init__(self, log_pi, mu, log_sigma, rho):
         '''
         Mixture of bivariate normal distribution
         Args:
@@ -18,15 +18,15 @@ class MixtureOfBivariateNormal(Distribution):
         super().__init__()
         self.log_pi = log_pi
         self.mu = mu
-        self.sigma = sigma
+        self.log_sigma = log_sigma
         self.rho = rho
 
     def log_prob(self, x):
-        t = (x - self.mu) / self.sigma
+        t = (x - self.mu) / self.log_sigma.exp()
         Z = (t ** 2).sum(-1) - 2 * self.rho * torch.prod(t, -1)
 
         num = -Z / (2 * (1 - self.rho ** 2))
-        denom = np.log(2 * np.pi) + torch.log(self.sigma).sum(-1) + .5 * torch.log(1 - self.rho ** 2)
+        denom = np.log(2 * np.pi) + self.log_sigma.sum(-1) + .5 * torch.log(1 - self.rho ** 2)
         log_N = num - denom
         log_prob = torch.logsumexp(self.log_pi + log_N, dim=-1)
         return -log_prob
@@ -34,7 +34,7 @@ class MixtureOfBivariateNormal(Distribution):
     def sample(self):
         index = self.log_pi.exp().multinomial(1).squeeze(1)
         mu = self.mu[torch.arange(index.shape[0]), index]
-        sigma = self.sigma[torch.arange(index.shape[0]), index]
+        sigma = self.log_sigma.exp()[torch.arange(index.shape[0]), index]
         rho = self.rho[torch.arange(index.shape[0]), index]
 
         mu1, mu2 = mu.unbind(-1)
@@ -65,25 +65,23 @@ class RNNDecoder(nn.Module):
         self.n_mixtures_output = n_mixtures_output
 
     def forward(self, strokes, prev_hidden=None):
-        out, prev_hidden = self.rnn(strokes)
+        out, prev_hidden = self.rnn(strokes, prev_hidden)
         out = self.output(self.drop(out))
         return out, prev_hidden
 
-    def score(self, strokes, mask, noise=3.):
+    def score(self, strokes, mask):
         K = self.n_mixtures_output
-        input_strokes = strokes + torch.randn_like(strokes) * noise
-        out = self.forward(input_strokes[:, :-1])[0]
+        out = self.forward(strokes[:, :-1])[0]
 
-        mu, sigma, pi, rho, eos = out.split([2 * K, 2 * K, K, K, 1], -1)
+        mu, log_sigma, pi, rho, eos = out.split([2 * K, 2 * K, K, K, 1], -1)
 
-        sigma = F.softplus(sigma)
         rho = torch.tanh(rho)
         log_pi = F.log_softmax(pi, dim=-1)
 
         mu = mu.view(mu.shape[:2] + (K, 2))  # (B, T, K, 2)
-        sigma = sigma.view(sigma.shape[:2] + (K, 2))  # (B, T, K, 2)
+        log_sigma = log_sigma.view(log_sigma.shape[:2] + (K, 2))  # (B, T, K, 2)
 
-        output_dist = MixtureOfBivariateNormal(log_pi, mu, sigma, rho)
+        output_dist = MixtureOfBivariateNormal(log_pi, mu, log_sigma, rho)
         stroke_loss = output_dist.log_prob(strokes[:, 1:, :2].unsqueeze(-2))
         eos_loss = F.binary_cross_entropy_with_logits(
             eos.squeeze(-1), strokes[:, 1:, -1], reduction='none'
@@ -93,7 +91,7 @@ class RNNDecoder(nn.Module):
         eos_loss = (eos_loss * mask).sum() / mask.sum()
         return stroke_loss, eos_loss
 
-    def sample(self, batch_size=8, maxlen=60):
+    def sample(self, batch_size=8, maxlen=600):
         K = self.n_mixtures_output
         x_t = torch.zeros(batch_size, 1, 3).float().cuda()
         prev_hidden = None
@@ -102,16 +100,15 @@ class RNNDecoder(nn.Module):
             strokes.append(x_t)
             out, prev_hidden = self.forward(x_t, prev_hidden)
 
-            mu, sigma, pi, rho, eos = out.squeeze(1).split(
+            mu, log_sigma, pi, rho, eos = out.squeeze(1).split(
                 [2 * K, 2 * K, K, K, 1], dim=-1
             )
-            sigma = F.softplus(sigma)
             rho = torch.tanh(rho)
             log_pi = F.log_softmax(pi, dim=-1)
             mu = mu.view(-1, K, 2)  # (B, K, 2)
-            sigma = sigma.view(-1, K, 2)  # (B, K, 2)
+            log_sigma = log_sigma.view(-1, K, 2)  # (B, K, 2)
 
-            output_dist = MixtureOfBivariateNormal(log_pi, mu, sigma, rho)
+            output_dist = MixtureOfBivariateNormal(log_pi, mu, log_sigma, rho)
             x_t = torch.cat([
                 output_dist.sample(),
                 torch.sigmoid(eos).bernoulli(),
