@@ -22,7 +22,7 @@ def train(epoch):
 
         opt.zero_grad()
         (stroke_loss + eos_loss).backward()
-        # torch.nn.utils.clip_grad_norm_(model.parameters(), 5.)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 10.)
         # for param in model.parameters():
         #     param.grad.clamp_(-10., 10.)
         opt.step()
