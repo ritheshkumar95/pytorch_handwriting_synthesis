@@ -2,7 +2,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 from torch.distributions.distribution import Distribution
 
 
@@ -50,14 +49,12 @@ class MixtureOfBivariateNormal(Distribution):
 
 class RNNDecoder(nn.Module):
     def __init__(
-        self, hidden_size, n_layers, n_mixtures_output, dropout
+        self, hidden_size, n_layers, n_mixtures_output
     ):
         super().__init__()
-        self.drop = nn.Dropout(dropout)
         self.rnn = nn.LSTM(
             3, hidden_size, n_layers,
-            batch_first=True,
-            dropout=dropout
+            batch_first=True
         )
         self.output = nn.Linear(
             hidden_size, n_mixtures_output * 6 + 1
@@ -66,12 +63,12 @@ class RNNDecoder(nn.Module):
 
     def forward(self, strokes, prev_hidden=None):
         out, prev_hidden = self.rnn(strokes, prev_hidden)
-        out = self.output(self.drop(out))
+        out = self.output(out)
         return out, prev_hidden
 
-    def score(self, strokes, mask):
+    def score(self, strokes, mask, prev_hidden=None):
         K = self.n_mixtures_output
-        out = self.forward(strokes[:, :-1])[0]
+        out, prev_hidden = self.forward(strokes[:, :-1], prev_hidden)
 
         mu, log_sigma, pi, rho, eos = out.split([2 * K, 2 * K, K, K, 1], -1)
 
@@ -89,7 +86,7 @@ class RNNDecoder(nn.Module):
         mask = mask[:, 1:]
         stroke_loss = (stroke_loss * mask).sum() / mask.sum()
         eos_loss = (eos_loss * mask).sum() / mask.sum()
-        return stroke_loss, eos_loss
+        return stroke_loss, eos_loss, prev_hidden
 
     def sample(self, batch_size=8, maxlen=600):
         K = self.n_mixtures_output
@@ -123,9 +120,8 @@ if __name__ == '__main__':
     hidden_size = 256
     n_layers = 3
     K_out = 20
-    dropout = .1
 
-    model = RNNDecoder(hidden_size, n_layers, K_out, dropout).cuda()
+    model = RNNDecoder(hidden_size, n_layers, K_out).cuda()
     strokes = torch.randn(16, 300, 3).cuda()
 
     loss = model.score(strokes)

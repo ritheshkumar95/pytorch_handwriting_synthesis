@@ -15,58 +15,37 @@ class UnconditionalDataLoader(object):
 
         self.strokes = self.h5['strokes'][()]
         self.strokes_mask = self.h5['strokes_mask'][()]
+        stroke_lens = self.strokes_mask.sum(-1)
 
-        idxs = np.arange(self.strokes.shape[0])
+        idxs = list(zip(np.arange(len(stroke_lens)), stroke_lens))
         np.random.seed(111)
         np.random.shuffle(idxs)
-        self.idxs = {
-            'train' : idxs[:int(len(idxs) * .9)],
-            'test' : idxs[int(len(idxs) * .9):]
-        }
 
-    def create_iterator(self, split='train', batch_size=64):
-        idxs = self.idxs[split]
+        self.idxs = {}
+        self.idxs['train'] = list(zip(*sorted(
+            idxs[:int(len(idxs) * .9)], key=lambda tup: tup[1]
+        )))
+        self.idxs['test'] = list(zip(*sorted(
+            idxs[int(len(idxs) * .9):], key=lambda tup: tup[1]
+        )))
+
+    def create_iterator(self, split='train', batch_size=64, seq_len=100):
+        idxs, stk_lengths = [np.array(x) for x in self.idxs[split]] 
         for i in range(0, len(idxs), batch_size):
-            stk = torch.from_numpy(self.strokes[idxs[i:i + batch_size]])[:, :600]
-            stk_mask = torch.from_numpy(self.strokes_mask[idxs[i:i + batch_size]])[:, :600]
+            max_stk_len = int(max(stk_lengths[i:i + batch_size]))
+            stk = torch.from_numpy(
+                self.strokes[idxs[i:i + batch_size]][:, :max_stk_len]
+            )
+            stk_mask = torch.from_numpy(
+                self.strokes_mask[idxs[i:i + batch_size]][:, :max_stk_len]
+            )
 
-            # last = stk_mask.sum(0).argmin()
-            # stk = stk[:, :last].cuda()
-            # stk_mask = stk_mask[:, :last].cuda()
-
-            yield stk.cuda(), stk_mask.cuda()
-
-
-class HandwritingSynthDataset(torch.utils.data.Dataset):
-    def __init__(
-        self, hdf5_path
-    ):
-        hdf5_path = Path(hdf5_path) / 'data.hdf5'
-        self.h5 = h5py.File(hdf5_path, 'r')
-        self.vocab = eval(self.h5.attrs['vocab'])
-        self.char2idx = eval(self.h5.attrs['char2idx'])
-
-    def __getitem__(self, index):
-        strokes = self.h5['strokes'][index][:300]
-        strokes_mask = self.h5['strokes_mask'][index][:300]
-
-        strokes = torch.from_numpy(strokes)
-        strokes_mask = torch.from_numpy(strokes_mask)
-        return strokes, strokes_mask
-
-    def __len__(self):
-        return len(self.h5['sentences'])
+            for j in range(1, max_stk_len, seq_len):
+                yield j == 1, stk[:, j-1:j + seq_len].cuda(), stk_mask[:, j-1:j + seq_len].cuda()
 
 
 if __name__ == '__main__':
-    path = '/tmp/kumarrit/iam_ondb'
-    # dataset = HandwritingSynthDataset(path)
-    # loader = DataLoader(dataset, batch_size=64, num_workers=0)
-    # for i, data in tqdm(enumerate(loader)):
-    #     if i == 0:
-    #         for x in data:
-    #             print(x.shape)
-
+    path = '/Tmp/kumarrit/iam_ondb'
     loader = UnconditionalDataLoader(path)
     for split in ['train', 'test']:
         itr = loader.create_iterator(split)
