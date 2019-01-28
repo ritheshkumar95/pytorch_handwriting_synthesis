@@ -16,6 +16,7 @@ class DataLoader(object):
         self.chars_mask = self.h5['chars_mask'][()]
         self.strokes = self.h5['strokes'][()]
         self.strokes_mask = self.h5['strokes_mask'][()]
+
         stroke_lens = self.strokes_mask.sum(-1)
 
         idxs = list(zip(np.arange(len(stroke_lens)), stroke_lens))
@@ -30,8 +31,11 @@ class DataLoader(object):
             idxs[int(len(idxs) * .9):], key=lambda tup: tup[1]
         )))
 
-    def create_iterator(self, split='train', batch_size=64):
-        idxs, stk_lengths = [np.array(x) for x in self.idxs[split]] 
+    def sent_to_idx(self, chars):
+        return ''.join([self.vocab[x] for x in chars])
+
+    def create_iterator(self, split='train', batch_size=64, seq_len=100):
+        idxs, stk_lengths = [np.array(x) for x in self.idxs[split]]
         for i in range(0, len(idxs), batch_size):
             max_stk_len = int(max(stk_lengths[i:i + batch_size]))
             stk = torch.from_numpy(
@@ -50,7 +54,12 @@ class DataLoader(object):
             chars = chars[idx].cuda()
             chars_mask = chars_mask[idx].cuda()
 
-            yield chars, chars_mask, stk, stk_mask
+            # chars, chars_mask, stk, stk_mask = [
+            #     x.cuda() for x in [chars, chars_mask, stk, stk_mask]
+            # ]
+
+            for j in range(1, max_stk_len, seq_len):
+                yield j == 1, chars, chars_mask, stk[:, j-1:j + seq_len], stk_mask[:, j-1:j + seq_len]
 
 
 if __name__ == '__main__':
@@ -59,5 +68,5 @@ if __name__ == '__main__':
     itr = dataset.create_iterator('train', batch_size=16)
     for i, data in tqdm(enumerate(itr)):
         if i == 0:
-            for x in data:
+            for x in data[1:]:
                 print(x.shape)

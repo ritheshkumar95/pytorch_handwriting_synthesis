@@ -3,40 +3,49 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
+from torch.distributions.distribution import Distribution
 
 
-def mixture_of_bivariate_normal_nll(x, log_pi, mu, log_sigma, rho):
-    x1, x2 = x.unbind(-1)
-    mu1, mu2 = mu.unbind(-1)
-    log_sigma1, log_sigma2 = log_sigma.unbind(-1)
-    sigma1, sigma2 = log_sigma1.exp(), log_sigma2.exp()
+class MixtureOfBivariateNormal(Distribution):
+    def __init__(self, log_pi, mu, log_sigma, rho):
+        '''
+        Mixture of bivariate normal distribution
+        Args:
+            mu, sigma - (B, T, K, 2)
+            rho - (B, T, K)
+            log_pi - (B, T, K)
+        '''
+        super().__init__()
+        self.log_pi = log_pi
+        self.mu = mu
+        self.log_sigma = log_sigma
+        self.rho = rho
 
-    Z = ((x1 - mu1) / sigma1) ** 2 + ((x2 - mu2) / sigma2) ** 2
-    Z -= (2 * rho * (x1 - mu1) * (x2 - mu2)) / (sigma1 * sigma2)
+    def log_prob(self, x):
+        t = (x - self.mu) / self.log_sigma.exp()
+        Z = (t ** 2).sum(-1) - 2 * self.rho * torch.prod(t, -1)
 
-    num = -Z / (2 * (1 - rho ** 2))
-    denom = np.log(np.pi * 2) + log_sigma1 + log_sigma2 + .5 * torch.log(1 - rho ** 2)
+        num = -Z / (2 * (1 - self.rho ** 2))
+        denom = np.log(2 * np.pi) + self.log_sigma.sum(-1) + .5 * torch.log(1 - self.rho ** 2)
+        log_N = num - denom
+        log_prob = torch.logsumexp(self.log_pi + log_N, dim=-1)
+        return -log_prob
 
-    log_N = num - denom
-    log_prob = torch.logsumexp(log_pi + log_N, dim=-1)
-    return -log_prob
+    def sample(self):
+        index = self.log_pi.exp().multinomial(1).squeeze(1)
+        mu = self.mu[torch.arange(index.shape[0]), index]
+        sigma = self.log_sigma.exp()[torch.arange(index.shape[0]), index]
+        rho = self.rho[torch.arange(index.shape[0]), index]
 
+        mu1, mu2 = mu.unbind(-1)
+        sigma1, sigma2 = sigma.unbind(-1)
+        z1 = torch.randn_like(mu1)
+        z2 = torch.randn_like(mu2)
 
-def mixture_of_bivariate_normal_sample(log_pi, mu, log_sigma, rho):
-    index = log_pi.exp().multinomial(1).squeeze(1)
-    mu = mu[torch.arange(index.shape[0]), index]
-    sigma = log_sigma.exp()[torch.arange(index.shape[0]), index]
-    rho = rho[torch.arange(index.shape[0]), index]
-
-    mu1, mu2 = mu.unbind(-1)
-    sigma1, sigma2 = sigma.unbind(-1)
-    z1 = torch.randn_like(mu1)
-    z2 = torch.randn_like(mu2)
-
-    x1 = mu1 + sigma1 * z1
-    mult = z2 * ((1 - rho ** 2) ** .5) + z1 * rho
-    x2 = mu2 + sigma2 * mult
-    return torch.stack([x1, x2], 1)
+        x1 = mu1 + sigma1 * z1
+        mult = z2 * ((1 - rho ** 2) ** .5) + z1 * rho
+        x2 = mu2 + sigma2 * mult
+        return torch.stack([x1, x2], 1)
 
 
 class SimpleEncoder(nn.Module):
@@ -69,6 +78,7 @@ class RNNEncoder(nn.Module):
 
     def forward(self, src, mask):
         # src, lengths, idx = self.sort(src, mask)
+        lengths = mask.sum(-1)
 
         src = self.emb(src)
         src = pack_padded_sequence(src, lengths, batch_first=True)
@@ -97,6 +107,7 @@ class GaussianAttention(nn.Module):
         phi = alpha * torch.exp(-beta * (kappa - u) ** 2)  # (B, T, K)
         phi = phi.sum(-1, keepdim=True)
 
+        # print(phi[0].sum().item())
         return (phi * ctx).sum(1), phi, kappa
 
 
@@ -110,7 +121,7 @@ class RNNDecoder(nn.Module):
             3 + enc_size, hidden_size
         )
         self.layer_n = nn.ModuleList([
-            nn.LSTMCell(3 + enc_size + hidden_size, hidden_size)
+            nn.LSTMCell(enc_size + hidden_size, hidden_size)
             for i in range(n_layers - 1)
         ])
         self.attention = GaussianAttention(hidden_size, n_mixtures_attention)
@@ -120,7 +131,9 @@ class RNNDecoder(nn.Module):
         self.h_0 = nn.Parameter(torch.randn(n_layers, hidden_size))
         self.c_0 = nn.Parameter(torch.randn(n_layers, hidden_size))
         self.w_0 = nn.Parameter(torch.randn(enc_size))
-        self.k_0 = nn.Parameter(torch.zeros(n_mixtures_attention))
+        self.register_buffer(
+            'k_0', torch.zeros(n_mixtures_attention)
+        )
 
     def forward(self, strokes, context, prev_states=None):
         bsz = strokes.size(0)
@@ -146,7 +159,7 @@ class RNNDecoder(nn.Module):
 
             for j, layer in enumerate(self.layer_n):
                 h_tm1[j+1], c_tm1[j+1] = layer(
-                    torch.cat([x_t, w_tm1, h_tm1[j]], 1),
+                    torch.cat([w_tm1, h_tm1[j]], 1),
                     (h_tm1[j+1], c_tm1[j+1])
                 )
 
@@ -163,7 +176,8 @@ class Seq2Seq(nn.Module):
         n_mixtures_attention, n_mixtures_output
     ):
         super().__init__()
-        self.enc = SimpleEncoder(vocab_size, enc_emb_size)
+        # self.enc = SimpleEncoder(vocab_size, enc_emb_size)
+        self.enc = RNNEncoder(vocab_size, enc_emb_size, enc_emb_size // 2, 2)
         self.dec = RNNDecoder(
             enc_emb_size, dec_hidden_size, dec_n_layers,
             n_mixtures_attention, n_mixtures_output
@@ -171,11 +185,11 @@ class Seq2Seq(nn.Module):
         self.n_mixtures_attention = n_mixtures_attention
         self.n_mixtures_output = n_mixtures_output
 
-    def forward(self, strokes, chars, chars_mask):
+    def forward(self, strokes, strokes_mask, chars, chars_mask, prev_states=None):
         K = self.n_mixtures_output
 
         ctx = self.enc(chars, chars_mask) * chars_mask.unsqueeze(-1)
-        out, att, _ = self.dec(strokes[:, :-1], ctx)
+        out, att, prev_states = self.dec(strokes[:, :-1], ctx, prev_states)
 
         mu, log_sigma, pi, rho, eos = out.split([2 * K, 2 * K, K, K, 1], -1)
         rho = torch.tanh(rho)
@@ -184,15 +198,15 @@ class Seq2Seq(nn.Module):
         mu = mu.view(mu.shape[:2] + (K, 2))  # (B, T, K, 2)
         log_sigma = log_sigma.view(log_sigma.shape[:2] + (K, 2))  # (B, T, K, 2)
 
-        stroke_loss = mixture_of_bivariate_normal_nll(
-            strokes[:, 1:, :2].unsqueeze(-2),
-            log_pi, mu, log_sigma, rho
-        ).mean()
+        dist = MixtureOfBivariateNormal(log_pi, mu, log_sigma, rho)
+        stroke_loss = dist.log_prob(strokes[:, 1:, :2].unsqueeze(-2))
         eos_loss = F.binary_cross_entropy_with_logits(
-            eos,
-            strokes[:, 1:, 2:3]
+            eos.squeeze(-1), strokes[:, 1:, -1], reduction='none'
         )
-        return stroke_loss, eos_loss, att
+        mask = strokes_mask[:, 1:]
+        stroke_loss = (stroke_loss * mask).sum() / mask.sum()
+        eos_loss = (eos_loss * mask).sum() / mask.sum()
+        return stroke_loss, eos_loss, att, prev_states
 
     def sample(self, chars, chars_mask, maxlen=1000):
         K = self.n_mixtures_output
@@ -213,8 +227,9 @@ class Seq2Seq(nn.Module):
             mu = mu.view(-1, K, 2)  # (B, K, 2)
             log_sigma = log_sigma.view(-1, K, 2)  # (B, K, 2)
 
+            dist = MixtureOfBivariateNormal(log_pi, mu, log_sigma, rho)
             x_t = torch.cat([
-                mixture_of_bivariate_normal_sample(log_pi, mu, log_sigma, rho),
+                dist.sample(),
                 torch.sigmoid(eos).bernoulli(),
             ], dim=1).unsqueeze(1)
 

@@ -15,16 +15,28 @@ from tensorboardX import SummaryWriter
 def train(epoch):
     global steps
     costs = []
-    itr = loader.create_iterator('train', batch_size=args.batch_size)
-    start = time.time()
-    for iterno, (chars, chars_mask, strokes, strokes_mask) in enumerate(itr):
-        stroke_loss, eos_loss, att = model(strokes, chars, chars_mask)
+    itr = loader.create_iterator('train', batch_size=args.batch_size, seq_len=args.seq_len)
+    start_time = time.time()
+    for iterno, (start, chars, chars_mask, strokes, strokes_mask) in enumerate(itr):
+        if start:
+            prev_states = None
+        else:
+            h_tm1, c_tm1, w_tm1, k_tm1 = prev_states
+            h_tm1 = [x.detach() for x in h_tm1]
+            c_tm1 = [x.detach() for x in c_tm1]
+            prev_states = (h_tm1, c_tm1, w_tm1.detach(), k_tm1.detach())
+
+        stroke_loss, eos_loss, att, prev_states = model(
+            strokes, strokes_mask,
+            chars, chars_mask,
+            prev_states
+        )
 
         opt.zero_grad()
         (stroke_loss + eos_loss).backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 10.)
-        # for param in model.parameters():
-        #     param.grad.clamp_(-10., 10.)
+        # torch.nn.utils.clip_grad_norm_(model.parameters(), 10.)
+        for param in model.parameters():
+            param.grad.clamp_(-1., 1.)
         opt.step()
 
         ####################################################
@@ -37,11 +49,11 @@ def train(epoch):
         if iterno % args.log_interval == 0:
             print(
                 "Train Epoch {} Iterno {} | ms/batch {:5.2f} | loss {}".format(
-                    epoch, iterno, 1000 * (time.time() - start) / len(costs),
+                    epoch, iterno, 1000 * (time.time() - start_time) / len(costs),
                     np.asarray(costs).mean(0)
                 )
             )
-            start = time.time()
+            start_time = time.time()
             costs = []
 
         if iterno % args.save_interval == 0:
@@ -55,7 +67,7 @@ def train(epoch):
             print("Saving samples....")
             st = time.time()
             with torch.no_grad():
-                chars, chars_mask, _, _ = test_data
+                _, chars, chars_mask, _, _ = test_data
                 out = model.sample(chars, chars_mask).detach().cpu().numpy()
                 for i in range(8):
                     fig = draw(out[i], save_file=root / ("generated_%d.png" % i))
@@ -67,10 +79,12 @@ def train(epoch):
 def test(epoch):
     global steps
     costs = []
-    itr = loader.create_iterator('test', batch_size=args.batch_size)
+    itr = loader.create_iterator('test', batch_size=args.batch_size, seq_len=1200)
     start = time.time()
-    for iterno, (chars, chars_mask, strokes, strokes_mask) in enumerate(itr):
-        stroke_loss, eos_loss, _ = model(strokes, chars, chars_mask)
+    for iterno, (start, chars, chars_mask, strokes, strokes_mask) in enumerate(itr):
+        stroke_loss, eos_loss, _, _ = model(
+            strokes, strokes_mask, chars, chars_mask
+        )
         costs.append([stroke_loss.item(), eos_loss.item()])
 
     stroke_loss, eos_loss = np.asarray(costs).mean(0)
@@ -91,7 +105,7 @@ def parse_args():
     parser.add_argument("--load_path", default=None)
 
     parser.add_argument("--vocab_size", type=int, default=83)
-    parser.add_argument("--enc_emb_size", type=int, default=64)
+    parser.add_argument("--enc_emb_size", type=int, default=256)
 
     parser.add_argument("--dec_hidden_size", type=int, default=256)
     parser.add_argument("--dec_n_layers", type=int, default=2)
@@ -100,11 +114,12 @@ def parse_args():
 
     parser.add_argument("--path", default='/Tmp/kumarrit/iam_ondb')
     parser.add_argument("--batch_size", type=int, default=64)
+    parser.add_argument("--seq_len", type=int, default=120)
 
-    parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--epochs", type=int, default=100)
-    parser.add_argument("--log_interval", type=int, default=10)
-    parser.add_argument("--save_interval", type=int, default=30)
+    parser.add_argument("--log_interval", type=int, default=25)
+    parser.add_argument("--save_interval", type=int, default=250)
     args = parser.parse_args()
     return args
 
@@ -124,7 +139,7 @@ model = Seq2Seq(
     args.n_mixtures_attention, args.n_mixtures_output
 ).cuda()
 
-opt = torch.optim.Adam(model.parameters(), lr=args.lr, amsgrad=True)
+opt = torch.optim.Adam(model.parameters(), lr=args.lr)
 
 if load_root and load_root.exists():
     model.load_state_dict(torch.load(load_root / 'model.pt'))
@@ -136,7 +151,7 @@ loader = DataLoader(args.path)
 itr = loader.create_iterator('test', batch_size=8)
 test_data = itr.__next__()
 for i in range(8):
-    fig = draw(test_data[2][i].cpu().numpy(), save_file=root / ("original_%d.png" % i))
+    fig = draw(test_data[3][i].cpu().numpy(), save_file=root / ("original_%d.png" % i))
     writer.add_figure("samples/original_%d" % i, fig, 0)
 
 costs = []

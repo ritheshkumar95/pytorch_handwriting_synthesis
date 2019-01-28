@@ -9,6 +9,15 @@ from tqdm import tqdm
 import h5py
 
 
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--save_file', default='data.hdf5')
+    parser.add_argument("--data_path", default='/data/iam_ondb')
+    parser.add_argument("--max_stroke_len", type=int, default=1200)
+    args = parser.parse_args()
+    return args
+
+
 def get_sentences(filename):
     data = open(filename).read().splitlines()
     data = [x.strip() for x in data]
@@ -34,16 +43,6 @@ def get_strokes(filename):
     offsets = coords_to_offsets(coords)[:args.max_stroke_len]
     offsets = normalize(offsets)
     return offsets
-
-
-def parse_args():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--save_file', default='data.hdf5')
-    parser.add_argument("--data_path", default='/data/iam_ondb')
-    parser.add_argument("--max_stroke_len", type=int, default=1200)
-    args = parser.parse_args()
-    return args
-
 
 if __name__ == '__main__':
     args = parse_args()
@@ -120,6 +119,9 @@ if __name__ == '__main__':
     ################################################
     pool = Pool()
     strokes = pool.map(get_strokes, strokePaths)
+
+    import ipdb; ipdb.set_trace()
+
     # strokes = [get_strokes(path) for path in strokePaths]
     strokes_arr = np.zeros((len(strokes), args.max_stroke_len, 3), dtype='float32')
     strokes_mask_arr = np.zeros((len(strokes), args.max_stroke_len), dtype='float32')
