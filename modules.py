@@ -121,7 +121,7 @@ class RNNDecoder(nn.Module):
             3 + enc_size, hidden_size
         )
         self.layer_n = nn.ModuleList([
-            nn.LSTMCell(enc_size + hidden_size, hidden_size)
+            nn.LSTMCell(3 + enc_size + hidden_size, hidden_size)
             for i in range(n_layers - 1)
         ])
         self.attention = GaussianAttention(hidden_size, n_mixtures_attention)
@@ -159,7 +159,7 @@ class RNNDecoder(nn.Module):
 
             for j, layer in enumerate(self.layer_n):
                 h_tm1[j+1], c_tm1[j+1] = layer(
-                    torch.cat([w_tm1, h_tm1[j]], 1),
+                    torch.cat([x_t, w_tm1, h_tm1[j]], 1),
                     (h_tm1[j+1], c_tm1[j+1])
                 )
 
@@ -192,7 +192,7 @@ class Seq2Seq(nn.Module):
         out, att, prev_states = self.dec(strokes[:, :-1], ctx, prev_states)
 
         mu, log_sigma, pi, rho, eos = out.split([2 * K, 2 * K, K, K, 1], -1)
-        rho = torch.tanh(rho)
+        rho = torch.tanh(rho) * .99
         log_pi = F.log_softmax(pi, dim=-1)
 
         mu = mu.view(mu.shape[:2] + (K, 2))  # (B, T, K, 2)
@@ -222,7 +222,7 @@ class Seq2Seq(nn.Module):
             mu, log_sigma, pi, rho, eos = out.squeeze(1).split(
                 [2 * K, 2 * K, K, K, 1], dim=-1
             )
-            rho = torch.tanh(rho)
+            rho = torch.tanh(rho) * .99
             log_pi = F.log_softmax(pi, dim=-1)
             mu = mu.view(-1, K, 2)  # (B, K, 2)
             log_sigma = log_sigma.view(-1, K, 2)  # (B, K, 2)

@@ -1,4 +1,4 @@
-from data.utils import draw
+from data.utils import draw, alphabet
 from dataset import DataLoader
 from modules import Seq2Seq
 import matplotlib.pyplot as plt
@@ -80,12 +80,14 @@ def test(epoch):
     global steps
     costs = []
     itr = loader.create_iterator('test', batch_size=args.batch_size, seq_len=1200)
-    start = time.time()
-    for iterno, (start, chars, chars_mask, strokes, strokes_mask) in enumerate(itr):
-        stroke_loss, eos_loss, _, _ = model(
-            strokes, strokes_mask, chars, chars_mask
-        )
-        costs.append([stroke_loss.item(), eos_loss.item()])
+    start_time = time.time()
+
+    with torch.no_grad():
+        for iterno, (start, chars, chars_mask, strokes, strokes_mask) in enumerate(itr):
+            stroke_loss, eos_loss, _, _ = model(
+                strokes, strokes_mask, chars, chars_mask
+            )
+            costs.append([stroke_loss.item(), eos_loss.item()])
 
     stroke_loss, eos_loss = np.asarray(costs).mean(0)
     writer.add_scalar("stroke_loss/test", costs[-1][0], steps)
@@ -93,7 +95,7 @@ def test(epoch):
 
     print(
         "Test Epoch {} | ms/batch {:5.2f} | loss {}".format(
-            epoch, 1000 * (time.time() - start) / len(costs),
+            epoch, 1000 * (time.time() - start_time) / len(costs),
             np.asarray(costs).mean(0)
         )
     )
@@ -104,27 +106,28 @@ def parse_args():
     parser.add_argument("--save_path", required=True)
     parser.add_argument("--load_path", default=None)
 
-    parser.add_argument("--vocab_size", type=int, default=83)
-    parser.add_argument("--enc_emb_size", type=int, default=256)
+    parser.add_argument("--enc_emb_size", type=int, default=64)
 
     parser.add_argument("--dec_hidden_size", type=int, default=256)
     parser.add_argument("--dec_n_layers", type=int, default=2)
     parser.add_argument("--n_mixtures_attention", type=int, default=10)
     parser.add_argument("--n_mixtures_output", type=int, default=20)
 
-    parser.add_argument("--path", default='/Tmp/kumarrit/iam_ondb')
+    parser.add_argument("--path", default='./data/processed')
     parser.add_argument("--batch_size", type=int, default=64)
-    parser.add_argument("--seq_len", type=int, default=120)
+    parser.add_argument("--seq_len", type=int, default=64)
 
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--epochs", type=int, default=100)
-    parser.add_argument("--log_interval", type=int, default=25)
-    parser.add_argument("--save_interval", type=int, default=250)
+    parser.add_argument("--log_interval", type=int, default=50)
+    parser.add_argument("--save_interval", type=int, default=500)
     args = parser.parse_args()
     return args
 
 
 args = parse_args()
+args.vocab_size = len(alphabet)
+print('Vocab size: ', args.vocab_size)
 
 root = Path(args.save_path)
 load_root = Path(args.load_path) if args.load_path else None
