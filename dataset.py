@@ -75,6 +75,8 @@ class DataLoader(object):
                 x.cuda() for x in [chars, chars_mask, stk, stk_mask]
             ]
 
+            # yield True, chars, chars_mask, stk[:, :200], stk_mask[:, :200]
+
             for j in range(1, max_stk_len, seq_len):
                 yield j == 1, chars, chars_mask, stk[:, j-1:j + seq_len], stk_mask[:, j-1:j + seq_len]
 

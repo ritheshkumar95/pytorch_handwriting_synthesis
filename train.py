@@ -12,11 +12,20 @@ from pathlib import Path
 from tensorboardX import SummaryWriter
 
 
-def plot_figure(arr):
+def plot_image(arr):
     fig = plt.Figure()
     ax = fig.add_subplot(111)
     im = ax.imshow(arr, origin='lower', aspect='auto', interpolation='nearest')
     fig.colorbar(im)
+    return fig
+
+
+def plot_lines(arr):
+    fig = plt.Figure()
+    ax = fig.add_subplot(111)
+    for i in range(arr.shape[0]):
+        ax.plot(arr[i], label='%d' % i)
+    ax.legend()
     return fig
 
 
@@ -31,16 +40,16 @@ def plot_attention():
                 strokes, strokes_mask, chars, chars_mask
             )
 
-            fig = plot_figure(att['phi'].squeeze().cpu().numpy().T)
+            fig = plot_image(att['phi'].squeeze().cpu().numpy().T)
             writer.add_figure('attention/phi_%d' % i, fig, steps)
 
-            fig = plot_figure(att['alpha'].squeeze().cpu().numpy().T)
+            fig = plot_lines(att['alpha'].squeeze().cpu().numpy().T)
             writer.add_figure('attention/alpha_%d' % i, fig, steps)
 
-            fig = plot_figure(att['beta'].squeeze().cpu().numpy().T)
+            fig = plot_lines(att['beta'].squeeze().cpu().numpy().T)
             writer.add_figure('attention/beta_%d' % i, fig, steps)
 
-            fig = plot_figure(att['kappa'].squeeze().cpu().numpy().T)
+            fig = plot_lines(att['kappa'].squeeze().cpu().numpy().T)
             writer.add_figure('attention/kappa_%d' % i, fig, steps)
 
 
@@ -53,10 +62,14 @@ def train(epoch):
         if start:
             prev_states = None
         else:
-            h_tm1, c_tm1, w_tm1, k_tm1 = prev_states
-            h_tm1 = [x.detach() for x in h_tm1]
-            c_tm1 = [x.detach() for x in c_tm1]
-            prev_states = (h_tm1, c_tm1, w_tm1.detach(), k_tm1.detach())
+            hid_0_tm1, w_tm1, k_tm1, hid_n_tm1 = prev_states
+            h, c = hid_0_tm1
+            hid_0_tm1 = (h.detach(), c.detach())
+            w_tm1 = w_tm1.detach()
+            k_tm1 = k_tm1.detach()
+            h, c = hid_n_tm1
+            hid_n_tm1 = (h.detach(), c.detach())
+            prev_states = (hid_0_tm1, w_tm1, k_tm1, hid_n_tm1)
 
         stroke_loss, eos_loss, att, prev_states = model(
             strokes, strokes_mask,
@@ -67,8 +80,8 @@ def train(epoch):
         opt.zero_grad()
         (stroke_loss + eos_loss).backward()
         # torch.nn.utils.clip_grad_norm_(model.parameters(), 10.)
-        for param in model.parameters():
-            param.grad.clamp_(-1., 1.)
+        # for param in model.parameters():
+        #     param.grad.clamp_(-1., 1.)
         opt.step()
 
         ####################################################
@@ -132,17 +145,17 @@ def parse_args():
     parser.add_argument("--save_path", required=True)
     parser.add_argument("--load_path", default=None)
 
-    parser.add_argument("--enc_emb_size", type=int, default=64)
-    parser.add_argument("--enc_hidden_size", type=int, default=128)
-    parser.add_argument("--enc_n_layers", type=int, default=2)
+    parser.add_argument("--enc_emb_size", type=int, default=128)
+    parser.add_argument("--enc_hidden_size", type=int, default=256)
+    parser.add_argument("--enc_n_layers", type=int, default=1)
 
-    parser.add_argument("--dec_hidden_size", type=int, default=256)
-    parser.add_argument("--dec_n_layers", type=int, default=2)
+    parser.add_argument("--dec_hidden_size", type=int, default=400)
+    parser.add_argument("--dec_n_layers", type=int, default=3)
     parser.add_argument("--n_mixtures_attention", type=int, default=10)
     parser.add_argument("--n_mixtures_output", type=int, default=20)
 
     parser.add_argument("--path", default='./data/processed')
-    parser.add_argument("--batch_size", type=int, default=64)
+    parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--seq_len", type=int, default=120)
 
     parser.add_argument("--lr", type=float, default=1e-4)
@@ -179,7 +192,7 @@ loader = DataLoader(args.path)
 #######################################################################
 # Dumping original data
 #######################################################################
-itr = loader.create_iterator('test', batch_size=8)
+itr = loader.create_iterator('test', batch_size=8, seq_len=1200)
 test_data = itr.__next__()
 for i in range(8):
     fig = draw(test_data[3][i].cpu().numpy(), save_file=root / ("original_%d.png" % i))
