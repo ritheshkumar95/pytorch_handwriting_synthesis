@@ -12,6 +12,38 @@ from pathlib import Path
 from tensorboardX import SummaryWriter
 
 
+def plot_figure(arr):
+    fig = plt.Figure()
+    ax = fig.add_subplot(111)
+    im = ax.imshow(arr, origin='lower', aspect='auto', interpolation='nearest')
+    fig.colorbar(im)
+    return fig
+
+
+def plot_attention():
+    global steps
+    itr = loader.create_iterator('test', batch_size=1, seq_len=1200)
+
+    with torch.no_grad():
+        for i in range(8):
+            start, chars, chars_mask, strokes, strokes_mask = itr.__next__()
+            stroke_loss, eos_loss, att, _ = model(
+                strokes, strokes_mask, chars, chars_mask
+            )
+
+            fig = plot_figure(att['phi'].squeeze().cpu().numpy().T)
+            writer.add_figure('attention/phi_%d' % i, fig, steps)
+
+            fig = plot_figure(att['alpha'].squeeze().cpu().numpy().T)
+            writer.add_figure('attention/alpha_%d' % i, fig, steps)
+
+            fig = plot_figure(att['beta'].squeeze().cpu().numpy().T)
+            writer.add_figure('attention/beta_%d' % i, fig, steps)
+
+            fig = plot_figure(att['kappa'].squeeze().cpu().numpy().T)
+            writer.add_figure('attention/kappa_%d' % i, fig, steps)
+
+
 def train(epoch):
     global steps
     costs = []
@@ -57,15 +89,9 @@ def train(epoch):
             costs = []
 
         if iterno % args.save_interval == 0:
-            att = att.detach().cpu().numpy()
-            fig = plt.Figure()
-            ax = fig.add_subplot(111)
-            im = ax.imshow(att[0, :, :, 0].T, origin='lower')
-            fig.colorbar(im)
-            writer.add_figure('attention_%d' % iterno, fig, steps)
-
             print("Saving samples....")
             st = time.time()
+            plot_attention()
             with torch.no_grad():
                 _, chars, chars_mask, _, _ = test_data
                 out = model.sample(chars, chars_mask).detach().cpu().numpy()
@@ -84,7 +110,7 @@ def test(epoch):
 
     with torch.no_grad():
         for iterno, (start, chars, chars_mask, strokes, strokes_mask) in enumerate(itr):
-            stroke_loss, eos_loss, _, _ = model(
+            stroke_loss, eos_loss, att, _ = model(
                 strokes, strokes_mask, chars, chars_mask
             )
             costs.append([stroke_loss.item(), eos_loss.item()])
@@ -107,6 +133,8 @@ def parse_args():
     parser.add_argument("--load_path", default=None)
 
     parser.add_argument("--enc_emb_size", type=int, default=64)
+    parser.add_argument("--enc_hidden_size", type=int, default=128)
+    parser.add_argument("--enc_n_layers", type=int, default=2)
 
     parser.add_argument("--dec_hidden_size", type=int, default=256)
     parser.add_argument("--dec_n_layers", type=int, default=2)
@@ -115,7 +143,7 @@ def parse_args():
 
     parser.add_argument("--path", default='./data/processed')
     parser.add_argument("--batch_size", type=int, default=64)
-    parser.add_argument("--seq_len", type=int, default=64)
+    parser.add_argument("--seq_len", type=int, default=120)
 
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--epochs", type=int, default=100)
@@ -137,7 +165,7 @@ pickle.dump(args, open(root / "args.pkl", "wb"))
 writer = SummaryWriter(str(root))
 
 model = Seq2Seq(
-    args.vocab_size, args.enc_emb_size,
+    args.vocab_size, args.enc_emb_size, args.enc_hidden_size, args.enc_n_layers,
     args.dec_hidden_size, args.dec_n_layers,
     args.n_mixtures_attention, args.n_mixtures_output
 ).cuda()
