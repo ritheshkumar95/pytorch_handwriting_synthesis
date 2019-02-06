@@ -23,29 +23,27 @@ class DataLoader(object):
             self.strokes_mask[i, :stk_len] = 1.
 
         idxs = list(zip(np.arange(len(self.stroke_lens)), self.stroke_lens))
-        np.random.seed(111)
+        np.random.seed(1)
         np.random.shuffle(idxs)
 
         self.idxs = {}
-        # self.idxs['train'] = list(zip(*sorted(
-        #     idxs[:int(len(idxs) * .9)], key=lambda tup: tup[1],
-        #     reverse=True
-        # )))
-        # self.idxs['test'] = list(zip(*sorted(
-        #     idxs[int(len(idxs) * .9):], key=lambda tup: tup[1],
-        #     reverse=True
-        # )))
-        self.idxs['train'] = list(zip(
-            *idxs[:int(len(idxs) * .9)]
-        ))
-        self.idxs['test'] = list(zip(
-            *idxs[int(len(idxs) * .9):]
-        ))
+        self.idxs['train'] = list(zip(*sorted(
+            idxs[:int(len(idxs) * .9)], key=lambda tup: tup[1]
+        )))
+        self.idxs['test'] = list(zip(*sorted(
+            idxs[int(len(idxs) * .9):], key=lambda tup: tup[1]
+        )))
+        # self.idxs['train'] = list(zip(
+        #     *idxs[:int(len(idxs) * .9)]
+        # ))
+        # self.idxs['test'] = list(zip(
+        #     *idxs[int(len(idxs) * .9):]
+        # ))
 
     def sent_to_idx(self, chars):
         return ''.join([chr(self.vocab[x]) for x in chars])
 
-    def create_iterator(self, split='train', batch_size=64, seq_len=100):
+    def create_iterator(self, split='train', batch_size=64):
         idxs, stk_lengths = [np.array(x) for x in self.idxs[split]]
         for i in range(0, len(idxs), batch_size):
             max_stk_len = max(stk_lengths[i:i + batch_size])
@@ -71,14 +69,7 @@ class DataLoader(object):
             chars = chars[idx].cuda()
             chars_mask = chars_mask[idx].cuda()
 
-            chars, chars_mask, stk, stk_mask = [
-                x.cuda() for x in [chars, chars_mask, stk, stk_mask]
-            ]
-
-            # yield True, chars, chars_mask, stk[:, :200], stk_mask[:, :200]
-
-            for j in range(1, max_stk_len, seq_len):
-                yield j == 1, chars, chars_mask, stk[:, j-1:j + seq_len], stk_mask[:, j-1:j + seq_len]
+            yield chars, chars_mask, stk, stk_mask
 
 
 if __name__ == '__main__':
