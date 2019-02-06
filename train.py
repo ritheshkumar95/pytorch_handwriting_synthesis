@@ -40,17 +40,8 @@ def plot_attention():
                 strokes, strokes_mask, chars, chars_mask
             )
 
-            fig = plot_image(att['phi'].squeeze().cpu().numpy().T)
-            writer.add_figure('attention/phi_%d' % i, fig, steps)
-
-            fig = plot_lines(att['alpha'].squeeze().cpu().numpy().T)
-            writer.add_figure('attention/alpha_%d' % i, fig, steps)
-
-            fig = plot_lines(att['beta'].squeeze().cpu().numpy().T)
-            writer.add_figure('attention/beta_%d' % i, fig, steps)
-
-            fig = plot_lines(att['kappa'].squeeze().cpu().numpy().T)
-            writer.add_figure('attention/kappa_%d' % i, fig, steps)
+            fig = plot_image(att.squeeze(0).cpu().numpy().T)
+            writer.add_figure('attention/probs_%d' % i, fig, steps)
 
 
 def train(epoch):
@@ -138,7 +129,6 @@ def parse_args():
 
     parser.add_argument("--dec_hidden_size", type=int, default=400)
     parser.add_argument("--dec_n_layers", type=int, default=3)
-    parser.add_argument("--n_mixtures_attention", type=int, default=10)
     parser.add_argument("--n_mixtures_output", type=int, default=20)
     parser.add_argument("--mask_loss", action='store_true')
 
@@ -168,7 +158,7 @@ model = Seq2Seq(
     args.vocab_size, args.enc_emb_size,
     args.enc_hidden_size, args.enc_n_layers,
     args.dec_hidden_size, args.dec_n_layers,
-    args.n_mixtures_attention, args.n_mixtures_output
+    args.n_mixtures_output
 ).cuda()
 print(model)
 
