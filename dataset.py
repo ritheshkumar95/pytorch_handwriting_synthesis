@@ -16,6 +16,11 @@ class DataLoader(object):
         self.strokes = np.load(root / 'x.npy').astype('float32')
         self.stroke_lens = np.load(root / 'x_len.npy')
 
+        speakers = np.load(root / 'w_id.npy')
+        speaker_dict = {x: i for i, x in enumerate(np.unique(speakers))}
+        self.speakers = np.array([speaker_dict[i] for i in speakers])
+        self.n_spkrs = len(np.unique(self.speakers))
+
         self.chars_mask = np.zeros_like(self.chars).astype('float32')
         self.strokes_mask = np.zeros(self.strokes.shape[:2]).astype('float32')
         for i, (char_len, stk_len) in enumerate(zip(self.chars_lens, self.stroke_lens)):
@@ -43,10 +48,11 @@ class DataLoader(object):
     def sent_to_idx(self, chars):
         return ''.join([chr(self.vocab[x]) for x in chars])
 
-    def create_iterator(self, split='train', batch_size=64):
+    def create_iterator(self, split='train', batch_size=64, mod_size=2):
         idxs, stk_lengths = [np.array(x) for x in self.idxs[split]]
         for i in range(0, len(idxs), batch_size):
             max_stk_len = max(stk_lengths[i:i + batch_size])
+            max_stk_len -= max_stk_len % mod_size
             max_char_len = max(self.chars_lens[idxs[i:i + batch_size]])
 
             stk = torch.from_numpy(
@@ -63,13 +69,18 @@ class DataLoader(object):
                 self.chars_mask[idxs[i:i + batch_size]][:, :max_char_len]
             )
 
+            spkrs = torch.from_numpy(
+                self.speakers[idxs[i:i + batch_size]]
+            )
+
             lengths, idx = torch.sort(chars_mask.sum(-1), 0, descending=True)
             stk = stk[idx].cuda()
             stk_mask = stk_mask[idx].cuda()
             chars = chars[idx].cuda()
-            chars_mask = chars_mask[idx].cuda()
+            chars_mask = chars_mask[idx].byte().cuda()
+            spkrs = spkrs[idx].long().cuda()
 
-            yield chars, chars_mask, stk, stk_mask
+            yield spkrs, chars, chars_mask, stk, stk_mask
 
 
 if __name__ == '__main__':

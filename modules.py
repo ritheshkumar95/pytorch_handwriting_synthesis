@@ -3,67 +3,88 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
-from torch.distributions.distribution import Distribution
 
 
-def make_contiguous(hid_t):
-    return (hid_t[0].contiguous(), hid_t[1].contiguous())
-
-
-def append_dict(main_dict, new_dict):
-    for key in main_dict.keys():
-        main_dict[key] += [new_dict[key]]
-
-
-class MixtureOfBivariateNormal(Distribution):
-    def __init__(self, log_pi, mu, log_sigma, rho):
-        '''
-        Mixture of bivariate normal distribution
-        Args:
-            mu, sigma - (B, T, K, 2)
-            rho - (B, T, K)
-            log_pi - (B, T, K)
-        '''
+class LocationLayer(nn.Module):
+    def __init__(self, attention_n_filters, attention_kernel_size,
+                 attention_dim):
         super().__init__()
-        self.log_pi = log_pi
-        self.mu = mu
-        self.log_sigma = log_sigma
-        self.rho = rho
+        padding = int((attention_kernel_size - 1) / 2)
+        self.location_conv = nn.Conv1d(
+            2, attention_n_filters,
+            kernel_size=attention_kernel_size,
+            padding=padding, bias=False
+        )
+        self.location_dense = nn.Linear(
+            attention_n_filters, attention_dim,
+            bias=False
+        )
 
-    def log_prob(self, x):
-        t = (x - self.mu) / self.log_sigma.exp()
-        Z = (t ** 2).sum(-1) - 2 * self.rho * torch.prod(t, -1)
-
-        num = -Z / (2 * (1 - self.rho ** 2))
-        denom = np.log(2 * np.pi) + self.log_sigma.sum(-1) + .5 * torch.log(1 - self.rho ** 2)
-        log_N = num - denom
-        log_prob = torch.logsumexp(self.log_pi + log_N, dim=-1)
-        return -log_prob
-
-    def sample(self):
-        index = self.log_pi.exp().multinomial(1).squeeze(1)
-        mu = self.mu[torch.arange(index.shape[0]), index]
-        sigma = self.log_sigma.exp()[torch.arange(index.shape[0]), index]
-        rho = self.rho[torch.arange(index.shape[0]), index]
-
-        mu1, mu2 = mu.unbind(-1)
-        sigma1, sigma2 = sigma.unbind(-1)
-        z1 = torch.randn_like(mu1)
-        z2 = torch.randn_like(mu2)
-
-        x1 = mu1 + sigma1 * z1
-        mult = z2 * ((1 - rho ** 2) ** .5) + z1 * rho
-        x2 = mu2 + sigma2 * mult
-        return torch.stack([x1, x2], 1)
+    def forward(self, attention_weights_cat):
+        processed_attention = self.location_conv(attention_weights_cat)
+        processed_attention = processed_attention.transpose(1, 2)
+        processed_attention = self.location_dense(processed_attention)
+        return processed_attention
 
 
-class SimpleEncoder(nn.Module):
-    def __init__(self, vocab_size, emb_size):
-        super().__init__()
-        self.emb = nn.Embedding(vocab_size, emb_size)
+class Attention(nn.Module):
+    def __init__(self, attention_rnn_dim, embedding_dim, attention_dim,
+                 attention_location_n_filters, attention_location_kernel_size):
+        super(Attention, self).__init__()
+        self.query_layer = nn.Linear(attention_rnn_dim, attention_dim, bias=False)
+        self.memory_layer = nn.Linear(embedding_dim, attention_dim, bias=False)
+        self.v = nn.Linear(attention_dim, 1, bias=False)
+        self.location_layer = LocationLayer(
+            attention_location_n_filters,
+            attention_location_kernel_size,
+            attention_dim
+        )
+        self.score_mask_value = -float("inf")
 
-    def forward(self, src, mask):
-        return self.emb(src)
+    def get_alignment_energies(self, query, processed_memory,
+                               attention_weights_cat):
+        """
+        PARAMS
+        ------
+        query: decoder output (batch, n_mel_channels * n_frames_per_step)
+        processed_memory: processed encoder outputs (B, T_in, attention_dim)
+        attention_weights_cat: cumulative and prev. att weights (B, 2, max_time)
+        RETURNS
+        -------
+        alignment (batch, max_time)
+        """
+
+        processed_query = self.query_layer(query.unsqueeze(1))
+        processed_attention_weights = self.location_layer(attention_weights_cat)
+        energies = self.v(torch.tanh(
+            processed_query + processed_attention_weights + processed_memory
+        ))
+
+        energies = energies.squeeze(-1)
+        return energies
+
+    def forward(self, attention_hidden_state, memory, processed_memory,
+                attention_weights_cat, mask):
+        """
+        PARAMS
+        ------
+        attention_hidden_state: attention rnn last output
+        memory: encoder outputs
+        processed_memory: processed encoder outputs
+        attention_weights_cat: previous and cummulative attention weights
+        mask: binary mask for padded data
+        """
+        alignment = self.get_alignment_energies(
+            attention_hidden_state, processed_memory, attention_weights_cat)
+
+        if mask is not None:
+            alignment.data.masked_fill_(1 - mask, self.score_mask_value)
+
+        attention_weights = F.softmax(alignment, dim=1)
+        attention_context = torch.bmm(attention_weights.unsqueeze(1), memory)
+        attention_context = attention_context.squeeze(1)
+
+        return attention_context, attention_weights
 
 
 class RNNEncoder(nn.Module):
@@ -87,183 +108,215 @@ class RNNEncoder(nn.Module):
         return out
 
 
-class ScaledDotProductAttention(nn.Module):
-    def __init__(self, enc_hidden_size, dec_hidden_size):
+class Aligner(nn.Module):
+    def __init__(self, n_spkrs, spkr_dim, enc_dim, out_dim, rnn_dim, attention_dim,
+                 attention_location_n_filters, attention_location_kernel_size):
         super().__init__()
-        self.project = nn.Linear(
-            dec_hidden_size,
-            enc_hidden_size
+        self.attention_layer = Attention(
+            rnn_dim, enc_dim,
+            attention_dim, attention_location_n_filters,
+            attention_location_kernel_size
         )
+        self.spkr_emb = nn.Embedding(n_spkrs, spkr_dim)
+        self.rnn = nn.LSTMCell(enc_dim + spkr_dim, rnn_dim)
+        self.linear_projection = nn.Linear(rnn_dim + enc_dim, out_dim)
 
-    def forward(self, key, value):
-        B, T, D = key.size()
-        scale = 1. / np.sqrt(D)
+        self.rnn_dim = rnn_dim
 
-        key = self.project(key)
-        att_weights = key.bmm(value.transpose(1, 2)) * scale
-        att_probs = F.softmax(att_weights, -1)
-        att_outputs = att_probs.bmm(value)
-        return att_outputs.squeeze(1), att_probs.squeeze(1)
+    def forward(self, output_timesteps, spkr, memory, mask):
+        B, T, D = memory.size()
+        processed_memory = self.attention_layer.memory_layer(memory)
+        spkr = self.spkr_emb(spkr)
 
+        # Initial hidden states
+        alpha_tm1 = torch.zeros(B, T).cuda()
+        alpha_cumulative = torch.zeros(B, T).cuda()
+        h_tm1 = torch.zeros(B, self.rnn_dim * 2).cuda().chunk(2, dim=-1)
+        w_tm1 = torch.zeros(B, D).cuda()
 
-class RNNDecoder(nn.Module):
-    def __init__(
-        self, enc_size, hidden_size, n_layers,
-        n_mixtures_output
-    ):
-        super().__init__()
-        self.layer_0 = nn.LSTM(3 + enc_size, hidden_size, batch_first=True)
-        self.layer_1 = nn.LSTM(3 + enc_size + hidden_size, hidden_size, batch_first=True)
-        self.layer_2 = nn.LSTM(3 + enc_size + hidden_size, hidden_size, batch_first=True)
-        self.attention = ScaledDotProductAttention(enc_size, hidden_size)
-        self.output = nn.Linear(
-            hidden_size * 3, n_mixtures_output * 6 + 1
-        )
-
-        self.h_0 = nn.Parameter(torch.randn(n_layers, hidden_size * 2))
-        self.w_0 = nn.Parameter(torch.randn(enc_size))
-
-        self.hidden_size = hidden_size
-        self.enc_size = enc_size
-
-    def forward(self, strokes, context, context_mask, prev_states=None):
-        bsz = strokes.size(0)
-
-        if prev_states is None:
-            hidden = self.h_0[:, None].repeat(1, bsz, 1)  # (L, B, D)
-            hid_0_tm1, hid_1_tm1, hid_2_tm1 = [
-                make_contiguous(x.chunk(2, dim=-1)) for x in hidden.split(1, dim=0)
-            ]
-            w_tm1 = self.w_0[None].repeat(bsz, 1)
-        else:
-            hid_0_tm1, hid_1_tm1, hid_2_tm1, w_tm1 = prev_states
-
-        layer_0_h_t = []
-        w_t = []
-        attention = []
-        for i, x_t in enumerate(strokes.split(1, dim=1)):
-            h_t, hid_0_tm1 = self.layer_0(
-                torch.cat([x_t, w_tm1.unsqueeze(1)], -1),
-                hid_0_tm1
+        outputs = []
+        for i in range(output_timesteps):
+            h_tm1 = self.rnn(torch.cat([w_tm1, spkr], 1), h_tm1)
+            alpha_cat = torch.stack([alpha_tm1, alpha_cumulative], dim=1)
+            w_tm1, alpha_tm1 = self.attention_layer(
+                h_tm1[0], memory, processed_memory, alpha_cat, mask
             )
-            w_tm1, att = self.attention(h_t, context)
+            alpha_cumulative += alpha_tm1
+            outputs.append(
+                self.linear_projection(torch.cat([h_tm1[0], w_tm1], 1))
+            )
 
-            layer_0_h_t.append(h_t[:, 0])
-            w_t.append(w_tm1)
-            attention.append(att)
+        return torch.stack(outputs, -1)
 
-        layer_0_h_t = torch.stack(layer_0_h_t, 1)
-        w_t = torch.stack(w_t, 1)
 
-        layer_1_h_t, hid_1_tm1 = self.layer_1(
-            torch.cat([strokes, layer_0_h_t, w_t], 2),
-            hid_1_tm1
+class ResnetBlock(nn.Module):
+    def __init__(self, dim, dilation=1):
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.ReflectionPad1d(dilation),
+            nn.Conv1d(dim, dim, kernel_size=3, dilation=dilation),
+            nn.InstanceNorm1d(dim),
+            nn.ReLU(True),
+            nn.Conv1d(dim, dim, kernel_size=1),
+            nn.InstanceNorm1d(dim)
         )
 
-        layer_2_h_t, hid_2_tm1 = self.layer_2(
-            torch.cat([strokes, layer_1_h_t, w_t], 2),
-            hid_2_tm1
-        )
-
-        outputs = self.output(
-            torch.cat([layer_0_h_t, layer_1_h_t, layer_2_h_t], -1)
-        )
-
-        attention = torch.stack(attention, 1)
-        return outputs, attention, (hid_0_tm1, hid_1_tm1, hid_2_tm1, w_tm1)
+    def forward(self, x):
+        return x + self.block(x)
 
 
-class Seq2Seq(nn.Module):
+class Generator(nn.Module):
     def __init__(
         self, vocab_size, enc_emb_size, enc_hidden_size, enc_n_layers,
-        dec_hidden_size, dec_n_layers,
-        n_mixtures_output
+        n_spkrs, spkr_size, rnn_size, align_size,
+        att_size, att_n_filters, att_kernel_size,
+        output_nc, ngf, n_downsampling, n_blocks
     ):
         super().__init__()
-        self.enc = RNNEncoder(vocab_size, enc_emb_size, enc_hidden_size // 2, enc_n_layers)
-        self.dec = RNNDecoder(
-            enc_hidden_size, dec_hidden_size, dec_n_layers,
-            n_mixtures_output
+
+        model = [
+            nn.ReflectionPad1d(3),
+            nn.Conv1d(align_size, ngf, kernel_size=7, padding=0),
+            nn.InstanceNorm1d(ngf),
+            nn.ReLU(True)
+        ]
+
+        # downsample
+        for i in range(n_downsampling):
+            mult = 2 ** i
+            model += [
+                nn.Conv1d(ngf * mult, ngf * mult * 2, kernel_size=4, stride=2, padding=1),
+                nn.InstanceNorm1d(ngf * mult * 2),
+                nn.ReLU(True)
+            ]
+
+        # resnet blocks
+        mult = 2 ** n_downsampling
+        for i in range(n_blocks):
+            model += [ResnetBlock(ngf * mult)]
+
+        # upsample
+        for i in range(n_downsampling):
+            mult = 2 ** (n_downsampling - i)
+            model += [
+                nn.ConvTranspose1d(
+                    ngf * mult, int(ngf * mult / 2),
+                    kernel_size=4, stride=2, padding=1
+                ),
+                nn.InstanceNorm1d(int(ngf * mult / 2)),
+                nn.ReLU(True)
+            ]
+
+        model += [
+            nn.ReflectionPad1d(3),
+            nn.Conv1d(ngf, output_nc, kernel_size=7, padding=0)
+        ]
+        self.model = nn.Sequential(*model)
+        self.encoder = RNNEncoder(vocab_size, enc_emb_size, enc_hidden_size // 2, enc_n_layers)
+        self.aligner = Aligner(
+            n_spkrs, spkr_size, enc_hidden_size, align_size, rnn_size,
+            att_size, att_n_filters, att_kernel_size
         )
-        self.n_mixtures_output = n_mixtures_output
 
-    def forward(self, strokes, strokes_mask, chars, chars_mask, prev_states=None, mask_loss=True):
-        K = self.n_mixtures_output
+    def forward(self, T, spkrs, chars, chars_mask):
+        memory = self.encoder(chars, chars_mask)
+        enc = self.aligner(T, spkrs, memory, chars_mask)
+        return self.model(enc)
 
-        ctx = self.enc(chars, chars_mask) * chars_mask.unsqueeze(-1)
-        out, att, prev_states = self.dec(strokes[:, :-1], ctx, chars_mask, prev_states)
 
-        mu, log_sigma, pi, rho, eos = out.split([2 * K, 2 * K, K, K, 1], -1)
-        rho = torch.tanh(rho)
-        log_pi = F.log_softmax(pi, dim=-1)
+class NLayerDiscriminator(nn.Module):
+    def __init__(self, input_nc, ndf, n_layers, downsampling_factor):
+        super().__init__()
+        model = nn.ModuleDict()
 
-        mu = mu.view(mu.shape[:2] + (K, 2))  # (B, T, K, 2)
-        log_sigma = log_sigma.view(log_sigma.shape[:2] + (K, 2))  # (B, T, K, 2)
-
-        dist = MixtureOfBivariateNormal(log_pi, mu, log_sigma, rho)
-        stroke_loss = dist.log_prob(strokes[:, 1:, :2].unsqueeze(-2))
-        eos_loss = F.binary_cross_entropy_with_logits(
-            eos.squeeze(-1), strokes[:, 1:, -1], reduction='none'
+        model["layer_0"] = nn.Sequential(
+            nn.ReflectionPad1d(7),
+            nn.Conv1d(input_nc, ndf, kernel_size=15),
+            nn.InstanceNorm1d(ndf),
+            nn.LeakyReLU(0.2, True),
         )
 
-        if mask_loss:
-            mask = strokes_mask[:, 1:]
-            stroke_loss = (stroke_loss * mask).sum() / mask.sum()
-            eos_loss = (eos_loss * mask).sum() / mask.sum()
-            return stroke_loss, eos_loss, att, prev_states
-        else:
-            return stroke_loss.mean(), eos_loss.mean(), att, prev_states
-
-    def sample(self, chars, chars_mask, maxlen=1000):
-        K = self.n_mixtures_output
-
-        ctx = self.enc(chars, chars_mask) * chars_mask.unsqueeze(-1)
-        x_t = torch.zeros(ctx.size(0), 1, 3).float().cuda()
-        prev_states = None
-        strokes = []
-        for i in range(maxlen):
-            strokes.append(x_t)
-            out, _, prev_states = self.dec(x_t, ctx, chars_mask, prev_states)
-
-            mu, log_sigma, pi, rho, eos = out.squeeze(1).split(
-                [2 * K, 2 * K, K, K, 1], dim=-1
+        nf = ndf
+        stride = downsampling_factor
+        for n in range(1, n_layers + 1):
+            nf_prev = nf
+            nf = min(nf * stride, 1024)
+            model["layer_%d" % n] = nn.Sequential(
+                nn.Conv1d(
+                    nf_prev, nf,
+                    kernel_size=stride * 2,
+                    stride=stride,
+                    padding=stride // 2
+                ),
+                nn.InstanceNorm1d(nf),
+                nn.LeakyReLU(0.2, True)
             )
-            rho = torch.tanh(rho)
-            log_pi = F.log_softmax(pi, dim=-1)
-            mu = mu.view(-1, K, 2)  # (B, K, 2)
-            log_sigma = log_sigma.view(-1, K, 2) - np.log(5)  # (B, K, 2)
 
-            dist = MixtureOfBivariateNormal(log_pi, mu, log_sigma, rho)
-            x_t = torch.cat([
-                dist.sample(),
-                torch.sigmoid(eos).bernoulli(),
-            ], dim=1).unsqueeze(1)
+        nf_prev = nf
+        nf = min(nf * 2, 1024)
 
-        return torch.cat(strokes, 1)
+        model["layer_%d" % (n_layers + 1)] = nn.Sequential(
+            nn.Conv1d(nf_prev, nf, kernel_size=5, stride=1, padding=2),
+            nn.InstanceNorm1d(nf),
+            nn.LeakyReLU(0.2, True)
+        )
+
+        model["layer_%d" % (n_layers + 2)] = nn.Conv1d(nf, 1, kernel_size=5, stride=1, padding=2)
+
+        self.model = model
+
+    def forward(self, x):
+        results = []
+        for key, layer in self.model.items():
+            x = layer(x)
+            results.append(x)
+        return results
+
+
+class Discriminator(nn.Module):
+    def __init__(self, input_nc, num_D, ndf, n_layers, downsampling_factor):
+        super().__init__()
+        self.model = nn.ModuleDict()
+        for i in range(num_D):
+            self.model["disc_%d" % i] = NLayerDiscriminator(
+                input_nc, ndf, n_layers, downsampling_factor
+            )
+
+        self.downsample = nn.AvgPool1d(
+            3, stride=2, padding=1, count_include_pad=False
+        )
+
+    def forward(self, x):
+        results = []
+        for key, disc in self.model.items():
+            results.append(disc(x))
+            x = self.downsample(x)
+        return results
 
 
 if __name__ == '__main__':
     vocab_size = 60
     emb_size = 128
     enc_hidden_size = 256
-    enc_n_layers = 1
-    dec_hidden_size = 400
-    dec_n_layers = 3
-    K_att = 10
-    K_out = 20
+    enc_n_layers = 3
+    align_size = 512
+    dec_hidden_size = 512
+    att_size = 256
+    att_n_filters = 32
+    att_kernel_size = 11
+    output_nc = 3
+    ngf = 64
+    n_blocks = 5
+    n_downsampling = 4
+    T = 512
 
-    model = Seq2Seq(
+    chars = torch.randint(0, 60, (1, 24)).long().cuda()
+    chars_mask = torch.ones_like(chars).byte().cuda()
+
+    netG = Generator(
         vocab_size, emb_size, enc_hidden_size, enc_n_layers,
-        dec_hidden_size, dec_n_layers,
-        K_att, K_out
+        dec_hidden_size, align_size, att_size, att_n_filters, att_kernel_size,
+        output_nc, ngf, n_downsampling, n_blocks
     ).cuda()
-    chars = torch.randint(0, vocab_size, (16, 50)).cuda()
-    chars_mask = torch.ones_like(chars).float()
-    strokes = torch.randn(16, 300, 3).cuda()
-    strokes_mask = torch.ones(16, 300).cuda()
+    print(netG(T, chars, chars_mask))
 
-    loss = model(strokes, strokes_mask, chars, chars_mask)
-    print(loss)
-
-    out = model.sample(chars, chars_mask)
-    print(out.shape)
