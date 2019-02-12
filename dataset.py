@@ -27,18 +27,18 @@ class DataLoader(object):
         np.random.shuffle(idxs)
 
         self.idxs = {}
-        self.idxs['train'] = list(zip(*sorted(
-            idxs[:int(len(idxs) * .9)], key=lambda tup: tup[1]
-        )))
-        self.idxs['test'] = list(zip(*sorted(
-            idxs[int(len(idxs) * .9):], key=lambda tup: tup[1]
-        )))
-        # self.idxs['train'] = list(zip(
-        #     *idxs[:int(len(idxs) * .9)]
-        # ))
-        # self.idxs['test'] = list(zip(
-        #     *idxs[int(len(idxs) * .9):]
-        # ))
+        # self.idxs['train'] = list(zip(*sorted(
+        #     idxs[:int(len(idxs) * .9)], key=lambda tup: tup[1]
+        # )))
+        # self.idxs['test'] = list(zip(*sorted(
+        #     idxs[int(len(idxs) * .9):], key=lambda tup: tup[1]
+        # )))
+        self.idxs['train'] = list(zip(
+            *idxs[:int(len(idxs) * .9)]
+        ))
+        self.idxs['test'] = list(zip(
+            *idxs[int(len(idxs) * .9):]
+        ))
 
     def sent_to_idx(self, chars):
         return ''.join([chr(self.vocab[x]) for x in chars])

@@ -10,11 +10,6 @@ def make_contiguous(hid_t):
     return (hid_t[0].contiguous(), hid_t[1].contiguous())
 
 
-def append_dict(main_dict, new_dict):
-    for key in main_dict.keys():
-        main_dict[key] += [new_dict[key]]
-
-
 class MixtureOfBivariateNormal(Distribution):
     def __init__(self, log_pi, mu, log_sigma, rho):
         '''
@@ -93,21 +88,17 @@ class GaussianAttention(nn.Module):
         self.n_mixtures = n_mixtures
         self.linear = nn.Linear(hidden_size, 3 * n_mixtures)
 
-    def forward(self, h_t, k_tm1, ctx, mask):
+    def forward(self, h_t, ctx, mask):
         B, T, _ = ctx.shape
         device = ctx.device
 
-        alpha, beta, kappa = torch.exp(self.linear(h_t))[:, None].chunk(3, dim=-1)  # (B, 1, K) each
-        eps = 1e-4
-        alpha += eps
-        beta += eps
-        kappa += eps
-        kappa = kappa * .20 + k_tm1.unsqueeze(1)
-        # kappa = kappa + k_tm1.unsqueeze(1)
+        alpha, beta, kappa = torch.exp(self.linear(h_t))[:, :, None].chunk(3, dim=-1)  # (B, t, 1, K) each
+        kappa *= .2
+        kappa = kappa.cumsum(1)
 
         u = torch.arange(T, dtype=torch.float32).to(device)
-        u = u[None, :, None].repeat(B, 1, 1)  # (B, T, 1)
-        phi = alpha * torch.exp(-beta * torch.pow(kappa - u, 2))  # (B, T, K)
+        u = u[None, None, :, None].repeat(B, 1, 1, 1)  # (B, 1, T, 1)
+        phi = alpha * torch.exp(-beta * torch.pow(kappa - u, 2))  # (B, t, T, K)
         phi = phi.sum(-1)
 
         monitor = {
@@ -116,7 +107,7 @@ class GaussianAttention(nn.Module):
             'kappa': kappa.squeeze(1),
             'phi': phi,
         }
-        return (phi.unsqueeze(-1) * ctx * mask.unsqueeze(-1)).sum(1), monitor
+        return (phi.unsqueeze(-1) * ctx[:, None] * mask[:, None, :, None]).sum(2), monitor
 
 
 class RNNDecoder(nn.Module):
@@ -125,7 +116,7 @@ class RNNDecoder(nn.Module):
         n_mixtures_attention, n_mixtures_output
     ):
         super().__init__()
-        self.layer_0 = nn.LSTM(3 + enc_size, hidden_size, batch_first=True)
+        self.layer_0 = nn.LSTM(3, hidden_size, batch_first=True)
         self.layer_1 = nn.LSTM(3 + enc_size + hidden_size, hidden_size, batch_first=True)
         self.layer_2 = nn.LSTM(3 + enc_size + hidden_size, hidden_size, batch_first=True)
         self.attention = GaussianAttention(hidden_size, n_mixtures_attention)
@@ -134,10 +125,6 @@ class RNNDecoder(nn.Module):
         )
 
         self.h_0 = nn.Parameter(torch.randn(n_layers, hidden_size * 2))
-        self.w_0 = nn.Parameter(torch.randn(enc_size))
-        self.register_buffer(
-            'k_0', torch.zeros(n_mixtures_attention)
-        )
 
         self.hidden_size = hidden_size
         self.enc_size = enc_size
@@ -151,28 +138,12 @@ class RNNDecoder(nn.Module):
             hid_0_tm1, hid_1_tm1, hid_2_tm1 = [
                 make_contiguous(x.chunk(2, dim=-1)) for x in hidden.split(1, dim=0)
             ]
-            w_tm1 = self.w_0[None].repeat(bsz, 1)
-            k_tm1 = self.k_0[None].repeat(bsz, 1)
         else:
-            hid_0_tm1, hid_1_tm1, hid_2_tm1, w_tm1, k_tm1 = prev_states
+            hid_0_tm1, hid_1_tm1, hid_2_tm1 = prev_states
 
-        layer_0_h_t = []
-        w_t = []
-        monitor = {'phi': [], 'alpha': [], 'beta': [], 'kappa': []}
-        for i, x_t in enumerate(strokes.split(1, dim=1)):
-            h_t, hid_0_tm1 = self.layer_0(
-                torch.cat([x_t, w_tm1.unsqueeze(1)], -1),
-                hid_0_tm1
-            )
-            w_tm1, stats = self.attention(h_t[:, 0], k_tm1, context, context_mask)
-            k_tm1 = stats['kappa']
+        layer_0_h_t, hid_0_tm1 = self.layer_0(strokes, hid_0_tm1)
 
-            layer_0_h_t.append(h_t[:, 0])
-            w_t.append(w_tm1)
-            append_dict(monitor, stats)
-
-        layer_0_h_t = torch.stack(layer_0_h_t, 1)
-        w_t = torch.stack(w_t, 1)
+        w_t, stats = self.attention(layer_0_h_t, context, context_mask)
 
         layer_1_h_t, hid_1_tm1 = self.layer_1(
             torch.cat([strokes, layer_0_h_t, w_t], 2),
@@ -188,8 +159,7 @@ class RNNDecoder(nn.Module):
             torch.cat([layer_0_h_t, layer_1_h_t, layer_2_h_t], -1)
         )
 
-        monitor = {x: torch.stack(y, 1) for x, y in monitor.items()}
-        return outputs, monitor, (hid_0_tm1, hid_1_tm1, hid_2_tm1, w_tm1, k_tm1)
+        return outputs, stats, (hid_0_tm1, hid_1_tm1, hid_2_tm1)
 
 
 class Seq2Seq(nn.Module):
@@ -199,10 +169,10 @@ class Seq2Seq(nn.Module):
         n_mixtures_attention, n_mixtures_output
     ):
         super().__init__()
-        self.enc = RNNEncoder(vocab_size, enc_emb_size, enc_hidden_size // 2, enc_n_layers)
-        # self.enc = SimpleEncoder(vocab_size, enc_emb_size)
+        # self.enc = RNNEncoder(vocab_size, enc_emb_size, enc_hidden_size // 2, enc_n_layers)
+        self.enc = SimpleEncoder(vocab_size, enc_emb_size)
         self.dec = RNNDecoder(
-            enc_hidden_size, dec_hidden_size, dec_n_layers,
+            enc_emb_size, dec_hidden_size, dec_n_layers,
             n_mixtures_attention, n_mixtures_output
         )
         self.n_mixtures_attention = n_mixtures_attention
