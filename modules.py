@@ -11,7 +11,7 @@ def make_contiguous(hid_t):
 
 
 class MixtureOfBivariateNormal(Distribution):
-    def __init__(self, log_pi, mu, log_sigma, rho):
+    def __init__(self, log_pi, mu, log_sigma, rho, bias=0.):
         '''
         Mixture of bivariate normal distribution
         Args:
@@ -24,6 +24,7 @@ class MixtureOfBivariateNormal(Distribution):
         self.mu = mu
         self.log_sigma = log_sigma
         self.rho = rho
+        self.bias = bias
 
     def log_prob(self, x):
         t = (x - self.mu) / self.log_sigma.exp()
@@ -36,9 +37,11 @@ class MixtureOfBivariateNormal(Distribution):
         return -log_prob
 
     def sample(self):
-        index = self.log_pi.exp().multinomial(1).squeeze(1)
+        index = (
+            self.log_pi.exp() * (1 + self.bias)
+        ).multinomial(1).squeeze(1)
         mu = self.mu[torch.arange(index.shape[0]), index]
-        sigma = self.log_sigma.exp()[torch.arange(index.shape[0]), index]
+        sigma = (self.log_sigma - self.bias).exp()[torch.arange(index.shape[0]), index]
         rho = self.rho[torch.arange(index.shape[0]), index]
 
         mu1, mu2 = mu.unbind(-1)
@@ -50,6 +53,18 @@ class MixtureOfBivariateNormal(Distribution):
         mult = z2 * ((1 - rho ** 2) ** .5) + z1 * rho
         x2 = mu2 + sigma2 * mult
         return torch.stack([x1, x2], 1)
+
+
+class OneHotEncoder(nn.Module):
+    def __init__(self, vocab_size):
+        super().__init__()
+        self.vocab_size = vocab_size
+
+    def forward(self, arr, mask):
+        shp = arr.size() + (self.vocab_size,)
+        one_hot_arr = torch.zeros(shp).float().cuda()
+        one_hot_arr.scatter_(-1, arr.unsqueeze(-1), 1)
+        return one_hot_arr
 
 
 class SimpleEncoder(nn.Module):
@@ -93,7 +108,7 @@ class GaussianAttention(nn.Module):
         device = ctx.device
 
         alpha, beta, kappa = torch.exp(self.linear(h_t))[:, :, None].chunk(3, dim=-1)  # (B, t, 1, K) each
-        kappa *= .2
+        # kappa *= .2
         kappa = kappa.cumsum(1)
 
         u = torch.arange(T, dtype=torch.float32).to(device)
@@ -116,15 +131,15 @@ class RNNDecoder(nn.Module):
         n_mixtures_attention, n_mixtures_output
     ):
         super().__init__()
-        self.layer_0 = nn.LSTM(3, hidden_size, batch_first=True)
-        self.layer_1 = nn.LSTM(3 + enc_size + hidden_size, hidden_size, batch_first=True)
-        self.layer_2 = nn.LSTM(3 + enc_size + hidden_size, hidden_size, batch_first=True)
+        self.lstm_0 = nn.LSTM(3, hidden_size, batch_first=True)
+        self.lstm_1 = nn.LSTM(3 + enc_size + hidden_size, hidden_size, batch_first=True)
+        self.lstm_2 = nn.LSTM(3 + enc_size + hidden_size, hidden_size, batch_first=True)
         self.attention = GaussianAttention(hidden_size, n_mixtures_attention)
-        self.output = nn.Linear(
+        self.fc = nn.Linear(
             hidden_size * 3, n_mixtures_output * 6 + 1
         )
 
-        self.h_0 = nn.Parameter(torch.randn(n_layers, hidden_size * 2))
+        # self.h_0 = nn.Parameter(torch.randn(n_layers, hidden_size * 2))
 
         self.hidden_size = hidden_size
         self.enc_size = enc_size
@@ -134,28 +149,29 @@ class RNNDecoder(nn.Module):
         bsz = strokes.size(0)
 
         if prev_states is None:
-            hidden = self.h_0[:, None].repeat(1, bsz, 1)  # (L, B, D)
-            hid_0_tm1, hid_1_tm1, hid_2_tm1 = [
-                make_contiguous(x.chunk(2, dim=-1)) for x in hidden.split(1, dim=0)
-            ]
+            # hidden = self.h_0[:, None].repeat(1, bsz, 1)  # (L, B, D)
+            # hid_0_tm1, hid_1_tm1, hid_2_tm1 = [
+            #     make_contiguous(x.chunk(2, dim=-1)) for x in hidden.split(1, dim=0)
+            # ]
+            hid_0_tm1, hid_1_tm1, hid_2_tm1 = None, None, None
         else:
             hid_0_tm1, hid_1_tm1, hid_2_tm1 = prev_states
 
-        layer_0_h_t, hid_0_tm1 = self.layer_0(strokes, hid_0_tm1)
+        layer_0_h_t, hid_0_tm1 = self.lstm_0(strokes, hid_0_tm1)
 
         w_t, stats = self.attention(layer_0_h_t, context, context_mask)
 
-        layer_1_h_t, hid_1_tm1 = self.layer_1(
+        layer_1_h_t, hid_1_tm1 = self.lstm_1(
             torch.cat([strokes, layer_0_h_t, w_t], 2),
             hid_1_tm1
         )
 
-        layer_2_h_t, hid_2_tm1 = self.layer_2(
+        layer_2_h_t, hid_2_tm1 = self.lstm_2(
             torch.cat([strokes, layer_1_h_t, w_t], 2),
             hid_2_tm1
         )
 
-        outputs = self.output(
+        outputs = self.fc(
             torch.cat([layer_0_h_t, layer_1_h_t, layer_2_h_t], -1)
         )
 
@@ -170,13 +186,21 @@ class Seq2Seq(nn.Module):
     ):
         super().__init__()
         # self.enc = RNNEncoder(vocab_size, enc_emb_size, enc_hidden_size // 2, enc_n_layers)
-        self.enc = SimpleEncoder(vocab_size, enc_emb_size)
+        # self.enc = SimpleEncoder(vocab_size, enc_emb_size)
+        self.enc = OneHotEncoder(vocab_size)
+        enc_hidden_size = vocab_size
         self.dec = RNNDecoder(
-            enc_emb_size, dec_hidden_size, dec_n_layers,
+            enc_hidden_size, dec_hidden_size, dec_n_layers,
             n_mixtures_attention, n_mixtures_output
         )
         self.n_mixtures_attention = n_mixtures_attention
         self.n_mixtures_output = n_mixtures_output
+
+        for name, param in self.named_parameters():
+            if 'weight' in name:
+                torch.nn.init.xavier_normal_(param)
+            elif 'phi' in name:
+                    torch.nn.init.constant_(param, -2.)
 
     def forward(self, strokes, strokes_mask, chars, chars_mask, prev_states=None, mask_loss=True):
         K = self.n_mixtures_output
@@ -222,9 +246,9 @@ class Seq2Seq(nn.Module):
             rho = torch.tanh(rho)
             log_pi = F.log_softmax(pi, dim=-1)
             mu = mu.view(-1, K, 2)  # (B, K, 2)
-            log_sigma = log_sigma.view(-1, K, 2) - np.log(5)  # (B, K, 2)
+            log_sigma = log_sigma.view(-1, K, 2)  # (B, K, 2)
 
-            dist = MixtureOfBivariateNormal(log_pi, mu, log_sigma, rho)
+            dist = MixtureOfBivariateNormal(log_pi, mu, log_sigma, rho, bias=3.)
             x_t = torch.cat([
                 dist.sample(),
                 torch.sigmoid(eos).bernoulli(),

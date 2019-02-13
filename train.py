@@ -66,8 +66,11 @@ def train(epoch):
 
         opt.zero_grad()
         (stroke_loss + eos_loss).backward()
-        for param in model.parameters():
-            param.grad.clamp_(-10., 10.)
+        for name, p in model.named_parameters():
+            if 'lstm' in name:
+                p.grad.data.clamp_(-10, 10)
+            elif 'fc' in name:
+                p.grad.data.clamp_(-100, 100)
         opt.step()
 
         ####################################################
@@ -132,20 +135,20 @@ def parse_args():
     parser.add_argument("--save_path", required=True)
     parser.add_argument("--load_path", default=None)
 
-    parser.add_argument("--enc_emb_size", type=int, default=256)
+    parser.add_argument("--enc_emb_size", type=int, default=128)
     parser.add_argument("--enc_hidden_size", type=int, default=400)
     parser.add_argument("--enc_n_layers", type=int, default=3)
 
-    parser.add_argument("--dec_hidden_size", type=int, default=400)
+    parser.add_argument("--dec_hidden_size", type=int, default=128)
     parser.add_argument("--dec_n_layers", type=int, default=3)
-    parser.add_argument("--n_mixtures_attention", type=int, default=10)
+    parser.add_argument("--n_mixtures_attention", type=int, default=6)
     parser.add_argument("--n_mixtures_output", type=int, default=20)
     parser.add_argument("--mask_loss", action='store_true')
 
     parser.add_argument("--path", default='./data/processed')
     parser.add_argument("--batch_size", type=int, default=32)
 
-    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--epochs", type=int, default=1000)
     parser.add_argument("--log_interval", type=int, default=25)
     parser.add_argument("--save_interval", type=int, default=250)
