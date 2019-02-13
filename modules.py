@@ -6,8 +6,9 @@ from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 from torch.distributions.distribution import Distribution
 
 
-def make_contiguous(hid_t):
-    return (hid_t[0].contiguous(), hid_t[1].contiguous())
+def append_dict(main_dict, new_dict):
+    for key in main_dict.keys():
+        main_dict[key] += [new_dict[key]]
 
 
 class MixtureOfBivariateNormal(Distribution):
@@ -103,17 +104,16 @@ class GaussianAttention(nn.Module):
         self.n_mixtures = n_mixtures
         self.linear = nn.Linear(hidden_size, 3 * n_mixtures)
 
-    def forward(self, h_t, ctx, mask):
+    def forward(self, h_t, k_tm1, ctx):
         B, T, _ = ctx.shape
         device = ctx.device
 
-        alpha, beta, kappa = torch.exp(self.linear(h_t))[:, :, None].chunk(3, dim=-1)  # (B, t, 1, K) each
-        # kappa *= .2
-        kappa = kappa.cumsum(1)
+        alpha, beta, kappa = torch.exp(self.linear(h_t))[:, None].chunk(3, dim=-1)  # (B, 1, K) each
+        kappa = kappa + k_tm1.unsqueeze(1)
 
         u = torch.arange(T, dtype=torch.float32).to(device)
-        u = u[None, None, :, None].repeat(B, 1, 1, 1)  # (B, 1, T, 1)
-        phi = alpha * torch.exp(-beta * torch.pow(kappa - u, 2))  # (B, t, T, K)
+        u = u[None, :, None].repeat(B, 1, 1)  # (B, T, 1)
+        phi = alpha * torch.exp(-beta * torch.pow(kappa - u, 2))  # (B, T, K)
         phi = phi.sum(-1)
 
         monitor = {
@@ -122,7 +122,7 @@ class GaussianAttention(nn.Module):
             'kappa': kappa.squeeze(1),
             'phi': phi,
         }
-        return (phi.unsqueeze(-1) * ctx[:, None] * mask[:, None, :, None]).sum(2), monitor
+        return (phi.unsqueeze(-1) * ctx).sum(1), monitor
 
 
 class RNNDecoder(nn.Module):
@@ -131,51 +131,63 @@ class RNNDecoder(nn.Module):
         n_mixtures_attention, n_mixtures_output
     ):
         super().__init__()
-        self.lstm_0 = nn.LSTM(3, hidden_size, batch_first=True)
-        self.lstm_1 = nn.LSTM(3 + enc_size + hidden_size, hidden_size, batch_first=True)
-        self.lstm_2 = nn.LSTM(3 + enc_size + hidden_size, hidden_size, batch_first=True)
+        self.lstm_0 = nn.LSTMCell(3 + enc_size, hidden_size)
+        self.lstm_1 = nn.LSTMCell(3 + enc_size + hidden_size, hidden_size)
+        self.lstm_2 = nn.LSTMCell(3 + enc_size + hidden_size, hidden_size)
         self.attention = GaussianAttention(hidden_size, n_mixtures_attention)
         self.fc = nn.Linear(
             hidden_size * 3, n_mixtures_output * 6 + 1
         )
 
-        # self.h_0 = nn.Parameter(torch.randn(n_layers, hidden_size * 2))
-
         self.hidden_size = hidden_size
         self.enc_size = enc_size
         self.n_mixtures_attention = n_mixtures_attention
+
+    def __init__hidden(self, bsz):
+        hiddens = torch.zeros(3, bsz, self.hidden_size * 2).float().cuda()
+        hiddens = [hiddens[i].chunk(2, dim=-1) for i in range(3)]
+        w_0 = torch.zeros(bsz, self.enc_size).float().cuda()
+        k_0 = torch.zeros(bsz, 1).float().cuda()
+        return hiddens, w_0, k_0
 
     def forward(self, strokes, context, context_mask, prev_states=None):
         bsz = strokes.size(0)
 
         if prev_states is None:
-            # hidden = self.h_0[:, None].repeat(1, bsz, 1)  # (L, B, D)
-            # hid_0_tm1, hid_1_tm1, hid_2_tm1 = [
-            #     make_contiguous(x.chunk(2, dim=-1)) for x in hidden.split(1, dim=0)
-            # ]
-            hid_0_tm1, hid_1_tm1, hid_2_tm1 = None, None, None
+            [hid_0, hid_1, hid_2], w_t, k_t = self.__init__hidden(bsz)
         else:
-            hid_0_tm1, hid_1_tm1, hid_2_tm1 = prev_states
+            [hid_0, hid_1, hid_2], w_t, k_t = prev_states
 
-        layer_0_h_t, hid_0_tm1 = self.lstm_0(strokes, hid_0_tm1)
+        outputs = []
+        monitor = {'phi': [], 'kappa': [], 'alpha': [], 'beta': []}
+        for x_t in strokes.unbind(1):
+            hid_0 = self.lstm_0(
+                torch.cat([x_t, w_t], 1),
+                hid_0
+            )
 
-        w_t, stats = self.attention(layer_0_h_t, context, context_mask)
+            w_t, stats = self.attention(hid_0[0], k_t, context)
+            k_t = stats['kappa']
 
-        layer_1_h_t, hid_1_tm1 = self.lstm_1(
-            torch.cat([strokes, layer_0_h_t, w_t], 2),
-            hid_1_tm1
-        )
+            hid_1 = self.lstm_1(
+                torch.cat([x_t, hid_0[0], w_t], 1),
+                hid_1
+            )
 
-        layer_2_h_t, hid_2_tm1 = self.lstm_2(
-            torch.cat([strokes, layer_1_h_t, w_t], 2),
-            hid_2_tm1
-        )
+            hid_2 = self.lstm_2(
+                torch.cat([x_t, hid_1[0], w_t], 1),
+                hid_2
+            )
 
-        outputs = self.fc(
-            torch.cat([layer_0_h_t, layer_1_h_t, layer_2_h_t], -1)
-        )
+            out = self.fc(
+                torch.cat([hid_0[0], hid_1[0], hid_2[0]], -1)
+            )
 
-        return outputs, stats, (hid_0_tm1, hid_1_tm1, hid_2_tm1)
+            outputs.append(out)
+            append_dict(monitor, stats)
+
+        monitor = {x: torch.stack(y, 1) for x, y in monitor.items()}
+        return torch.stack(outputs, 1), monitor, ([hid_0, hid_1, hid_2], w_t, k_t)
 
 
 class Seq2Seq(nn.Module):
