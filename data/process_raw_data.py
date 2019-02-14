@@ -23,7 +23,7 @@ def get_stroke_sequence(filename):
         for i, point in enumerate(stroke):
             coords.append([
                 int(point.attrib['x']),
-                int(point.attrib['y']),
+                -1 *  int(point.attrib['y']),
                 int(i == len(stroke) - 1)
             ])
     coords = np.array(coords)

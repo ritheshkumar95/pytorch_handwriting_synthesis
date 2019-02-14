@@ -108,13 +108,13 @@ def draw(
         stroke.append((x, y))
         if eos == 1:
             xs, ys = zip(*stroke)
-            ys = np.array(ys) * -1
+            ys = np.array(ys)
             ax.plot(xs, ys, 'k', c='blue')
             stroke = []
 
     if stroke:
         xs, ys = zip(*stroke)
-        ys = np.array(ys) * -1
+        ys = np.array(ys)
         ax.plot(xs, ys, 'k', c='blue')
         stroke = []
 

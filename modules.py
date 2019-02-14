@@ -28,7 +28,7 @@ class MixtureOfBivariateNormal(Distribution):
         self.bias = bias
 
     def log_prob(self, x):
-        t = (x - self.mu) / self.log_sigma.exp()
+        t = (x - self.mu) / (self.log_sigma.exp() + 1e-4)
         Z = (t ** 2).sum(-1) - 2 * self.rho * torch.prod(t, -1)
 
         num = -Z / (2 * (1 - self.rho ** 2))
@@ -109,7 +109,7 @@ class GaussianAttention(nn.Module):
         device = ctx.device
 
         alpha, beta, kappa = torch.exp(self.linear(h_t))[:, None].chunk(3, dim=-1)  # (B, 1, K) each
-        kappa = kappa + k_tm1.unsqueeze(1)
+        kappa = kappa * .2 + k_tm1.unsqueeze(1)
 
         u = torch.arange(T, dtype=torch.float32).to(device)
         u = u[None, :, None].repeat(B, 1, 1)  # (B, T, 1)
