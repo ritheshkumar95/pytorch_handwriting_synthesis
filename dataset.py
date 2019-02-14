@@ -1,55 +1,83 @@
 import numpy as np
-import h5py
 import torch
 from tqdm import tqdm
 from torch.utils.data import DataLoader
 from pathlib import Path
+from collections import Counter
+from data.utils import draw
 
 
-class UnconditionalDataLoader(object):
-    def __init__(self, hdf5_path):    
-        hdf5_path = Path(hdf5_path) / 'data.hdf5'
-        self.h5 = h5py.File(hdf5_path, 'r')
-        self.vocab = eval(self.h5.attrs['vocab'])
-        self.char2idx = eval(self.h5.attrs['char2idx'])
+def pad_and_mask_batch(batch):
+    strokes, sentences = zip(*batch)
+    stroke_lengths = [len(x) for x in strokes]
+    sentence_lengths = [len(x) for x in sentences]
+    bsz = len(batch)
 
-        self.strokes = self.h5['strokes'][()]
-        self.strokes_mask = self.h5['strokes_mask'][()]
-        stroke_lens = self.strokes_mask.sum(-1)
+    stroke_arr = torch.zeros(bsz, max(stroke_lengths), 3).float()
+    stroke_mask = torch.zeros(bsz, max(stroke_lengths)).float()
 
-        idxs = list(zip(np.arange(len(stroke_lens)), stroke_lens))
-        np.random.seed(111)
-        np.random.shuffle(idxs)
+    sent_arr = torch.zeros(bsz, max(sentence_lengths)).long()
+    sent_mask = torch.zeros(bsz, max(sentence_lengths)).float()
 
-        self.idxs = {}
-        self.idxs['train'] = list(zip(*sorted(
-            idxs[:int(len(idxs) * .9)], key=lambda tup: tup[1]
-        )))
-        self.idxs['test'] = list(zip(*sorted(
-            idxs[int(len(idxs) * .9):], key=lambda tup: tup[1]
-        )))
+    for i, (stroke, length) in enumerate(zip(strokes, stroke_lengths)):
+        stroke_arr[i, :length] = stroke
+        stroke_mask[i, :length] = 1.
 
-    def create_iterator(self, split='train', batch_size=64, seq_len=100):
-        idxs, stk_lengths = [np.array(x) for x in self.idxs[split]] 
-        for i in range(0, len(idxs), batch_size):
-            max_stk_len = int(max(stk_lengths[i:i + batch_size]))
-            stk = torch.from_numpy(
-                self.strokes[idxs[i:i + batch_size]][:, :max_stk_len]
-            )
-            stk_mask = torch.from_numpy(
-                self.strokes_mask[idxs[i:i + batch_size]][:, :max_stk_len]
-            )
+    for i, (sent, length) in enumerate(zip(sentences, sentence_lengths)):
+        sent_arr[i, :length] = sent
+        sent_mask[i, :length] = 1.
 
-            for j in range(1, max_stk_len, seq_len):
-                yield j == 1, stk[:, j-1:j + seq_len].cuda(), stk_mask[:, j-1:j + seq_len].cuda()
+    return stroke_arr, stroke_mask, sent_arr, sent_mask
+
+
+class HandwritingDataset(torch.utils.data.Dataset):
+    def __init__(self, path):
+        super().__init__()
+        root = Path(path)
+        self.strokes = np.load(root / 'strokes.npy', encoding='latin1')
+        self.sentences = open(root / 'sentences.txt').read().splitlines()
+        self.sentences = [list(x) for x in self.sentences]
+
+        ctr = Counter()
+        for line in self.sentences:
+            ctr.update(line)
+
+        self.vocab = sorted(list(ctr.keys()))
+        self.char2idx = {x: i for i, x in enumerate(self.vocab)}
+        self.max_stroke_len = 1200
+
+    def __len__(self):
+        return self.strokes.shape[0]
+
+    def sent2idx(self, sent):
+        return np.asarray([self.char2idx[c] for c in sent])
+
+    def idx2sent(self, sent):
+        return ''.join(self.vocab[i] for i in sent)
+
+    def __getitem__(self, idx):
+        stroke = self.strokes[idx][:self.max_stroke_len]
+        stroke = torch.from_numpy(stroke).clamp(-50, 50)
+        stroke[:, 1:] /= 10
+
+        sentence = torch.from_numpy(
+            self.sent2idx(self.sentences[idx])
+        ).long()
+        return stroke, sentence
 
 
 if __name__ == '__main__':
     path = '/Tmp/kumarrit/iam_ondb'
-    loader = UnconditionalDataLoader(path)
-    for split in ['train', 'test']:
-        itr = loader.create_iterator(split)
-        for i, data in tqdm(enumerate(itr)):
-            if i == 0:
-                for x in data:
-                    print(x.shape)
+    dataset = HandwritingDataset('./lyrebird_data')
+    loader = DataLoader(dataset, batch_size=16, collate_fn=pad_and_mask_batch)
+    for i, (stk, stk_mask, sent, sent_mask) in tqdm(enumerate(loader)):
+        if i == 0:
+            print(stk.shape)
+            print(stk_mask.shape)
+            print(sent.shape)
+            print(sent_mask.shape)
+
+            for i in range(16):
+                print(dataset.idx2sent(sent[i].tolist()))
+                draw(stk[i].numpy(), save_file='test.png')
+                input()
