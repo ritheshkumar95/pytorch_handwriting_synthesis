@@ -1,5 +1,5 @@
 from data.utils import draw
-from dataset import UnconditionalDataLoader
+from dataset import HandwritingDataset, pad_and_mask_batch
 from modules import RNNDecoder
 
 import pickle

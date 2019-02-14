@@ -31,7 +31,7 @@ def pad_and_mask_batch(batch):
 
 
 class HandwritingDataset(torch.utils.data.Dataset):
-    def __init__(self, path):
+    def __init__(self, path, split='train'):
         super().__init__()
         root = Path(path)
         self.strokes = np.load(root / 'strokes.npy', encoding='latin1')
@@ -45,6 +45,13 @@ class HandwritingDataset(torch.utils.data.Dataset):
         self.vocab = sorted(list(ctr.keys()))
         self.char2idx = {x: i for i, x in enumerate(self.vocab)}
         self.max_stroke_len = 1200
+
+        if split == 'train':
+            self.strokes = self.strokes[:-500]
+            self.sentences = self.sentences[:-500]
+        else:
+            self.strokes = self.strokes[-500:]
+            self.sentences = self.sentences[-500:]
 
     def __len__(self):
         return self.strokes.shape[0]
