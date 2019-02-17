@@ -12,7 +12,7 @@ def append_dict(main_dict, new_dict):
 
 
 class MixtureOfBivariateNormal(Distribution):
-    def __init__(self, log_pi, mu, log_sigma, rho, bias=0.):
+    def __init__(self, log_pi, mu, log_sigma, rho, eps=1e-6, bias=0.):
         '''
         Mixture of bivariate normal distribution
         Args:
@@ -25,19 +25,30 @@ class MixtureOfBivariateNormal(Distribution):
         self.mu = mu
         self.log_sigma = log_sigma
         self.rho = rho
+
         self.bias = bias
+        self.eps = eps
 
     def log_prob(self, x):
-        t = (x - self.mu) / (self.log_sigma.exp() + 1e-4)
+        t = (x - self.mu) / (self.log_sigma.exp() + self.eps)
         Z = (t ** 2).sum(-1) - 2 * self.rho * torch.prod(t, -1)
 
-        num = -Z / (2 * (1 - self.rho ** 2))
-        denom = np.log(2 * np.pi) + self.log_sigma.sum(-1) + .5 * torch.log(1 - self.rho ** 2)
+        num = -Z / (2 * (1 - self.rho ** 2) + self.eps)
+        denom = np.log(2 * np.pi) + self.log_sigma.sum(-1) + .5 * torch.log(1 - self.rho ** 2 + self.eps)
         log_N = num - denom
         log_prob = torch.logsumexp(self.log_pi + log_N, dim=-1)
         return -log_prob
 
     def sample(self):
+        flag = False
+        if self.log_pi.dim() == 3:
+            B, T, N = self.log_pi.shape
+            flag = True
+            self.log_pi = self.log_pi.view(-1, N)
+            self.mu = self.mu.contiguous().view(-1, N, 2)
+            self.log_sigma = self.log_sigma.contiguous().view(-1, N, 2)
+            self.rho = self.rho.contiguous().view(-1, N)
+
         index = (
             self.log_pi.exp() * (1 + self.bias)
         ).multinomial(1).squeeze(1)
@@ -53,7 +64,10 @@ class MixtureOfBivariateNormal(Distribution):
         x1 = mu1 + sigma1 * z1
         mult = z2 * ((1 - rho ** 2) ** .5) + z1 * rho
         x2 = mu2 + sigma2 * mult
-        return torch.stack([x1, x2], 1)
+        out = torch.stack([x1, x2], 1)
+        if flag:
+            out = out.view(B, T, 2)
+        return out
 
 
 class OneHotEncoder(nn.Module):
@@ -68,53 +82,23 @@ class OneHotEncoder(nn.Module):
         return one_hot_arr
 
 
-class SimpleEncoder(nn.Module):
-    def __init__(self, vocab_size, emb_size):
-        super().__init__()
-        self.emb = nn.Embedding(vocab_size, emb_size)
-
-    def forward(self, src, mask):
-        return self.emb(src)
-
-
-class RNNEncoder(nn.Module):
-    def __init__(self, vocab_size, emb_size, hidden_size, n_layers):
-        super().__init__()
-        self.emb = nn.Embedding(vocab_size, emb_size)
-
-        self.rnn = nn.LSTM(
-            emb_size, hidden_size, n_layers,
-            batch_first=True,
-            bidirectional=True,
-        )
-
-    def forward(self, src, mask):
-        lengths = mask.sum(-1)
-
-        src = self.emb(src)
-        src = pack_padded_sequence(src, lengths, batch_first=True)
-        out, _ = self.rnn(src)
-        out = pad_packed_sequence(out, batch_first=True)[0]
-        return out
-
-
 class GaussianAttention(nn.Module):
     def __init__(self, hidden_size, n_mixtures):
         super().__init__()
         self.n_mixtures = n_mixtures
         self.linear = nn.Linear(hidden_size, 3 * n_mixtures)
 
-    def forward(self, h_t, k_tm1, ctx):
+    def forward(self, h_t, k_tm1, ctx, ctx_mask):
         B, T, _ = ctx.shape
         device = ctx.device
 
         alpha, beta, kappa = torch.exp(self.linear(h_t))[:, None].chunk(3, dim=-1)  # (B, 1, K) each
-        kappa = kappa * .2 + k_tm1.unsqueeze(1)
+        kappa = kappa + k_tm1.unsqueeze(1)
 
         u = torch.arange(T, dtype=torch.float32).to(device)
         u = u[None, :, None].repeat(B, 1, 1)  # (B, T, 1)
         phi = alpha * torch.exp(-beta * torch.pow(kappa - u, 2))  # (B, T, K)
-        phi = phi.sum(-1)
+        phi = phi.sum(-1) * ctx_mask
 
         monitor = {
             'alpha': alpha.squeeze(1),
@@ -166,7 +150,7 @@ class RNNDecoder(nn.Module):
                 hid_0
             )
 
-            w_t, stats = self.attention(hid_0[0], k_t, context)
+            w_t, stats = self.attention(hid_0[0], k_t, context, context_mask)
             k_t = stats['kappa']
 
             hid_1 = self.lstm_1(
@@ -192,27 +176,23 @@ class RNNDecoder(nn.Module):
 
 class Seq2Seq(nn.Module):
     def __init__(
-        self, vocab_size, enc_emb_size, enc_hidden_size, enc_n_layers,
-        dec_hidden_size, dec_n_layers,
+        self, vocab_size, dec_hidden_size, dec_n_layers,
         n_mixtures_attention, n_mixtures_output
     ):
         super().__init__()
-        # self.enc = RNNEncoder(vocab_size, enc_emb_size, enc_hidden_size // 2, enc_n_layers)
-        # self.enc = SimpleEncoder(vocab_size, enc_emb_size)
         self.enc = OneHotEncoder(vocab_size)
-        enc_hidden_size = vocab_size
         self.dec = RNNDecoder(
-            enc_hidden_size, dec_hidden_size, dec_n_layers,
+            vocab_size, dec_hidden_size, dec_n_layers,
             n_mixtures_attention, n_mixtures_output
         )
         self.n_mixtures_attention = n_mixtures_attention
         self.n_mixtures_output = n_mixtures_output
 
-        for name, param in self.named_parameters():
-            if 'weight' in name:
-                torch.nn.init.xavier_normal_(param)
-            elif 'phi' in name:
-                    torch.nn.init.constant_(param, -2.)
+        # for name, param in self.named_parameters():
+        #     if 'weight' in name:
+        #         torch.nn.init.xavier_normal_(param)
+        #     elif 'phi' in name:
+        #             torch.nn.init.constant_(param, -2.)
 
     def forward(self, strokes, strokes_mask, chars, chars_mask, prev_states=None, mask_loss=True):
         K = self.n_mixtures_output
@@ -228,18 +208,24 @@ class Seq2Seq(nn.Module):
         log_sigma = log_sigma.view(log_sigma.shape[:2] + (K, 2))  # (B, T, K, 2)
 
         dist = MixtureOfBivariateNormal(log_pi, mu, log_sigma, rho)
-        stroke_loss = dist.log_prob(strokes[:, 1:, :2].unsqueeze(-2))
+
+        stroke_loss = dist.log_prob(strokes[:, 1:, 1:].unsqueeze(-2))
         eos_loss = F.binary_cross_entropy_with_logits(
-            eos.squeeze(-1), strokes[:, 1:, -1], reduction='none'
+            -eos.squeeze(-1), strokes[:, 1:, 0], reduction='none'
         )
+
+        samp = torch.cat([
+            torch.sigmoid(-eos).bernoulli(),
+            dist.sample(),
+        ], dim=-1)
 
         if mask_loss:
             mask = strokes_mask[:, 1:]
-            stroke_loss = (stroke_loss * mask).sum() / mask.sum()
-            eos_loss = (eos_loss * mask).sum() / mask.sum()
-            return stroke_loss, eos_loss, att, prev_states
+            stroke_loss = (stroke_loss * mask).sum(-1).mean()
+            eos_loss = (eos_loss * mask).sum(-1).mean()
+            return stroke_loss, eos_loss, att, prev_states, samp
         else:
-            return stroke_loss.mean(), eos_loss.mean(), att, prev_states
+            return stroke_loss.mean(), eos_loss.mean(), att, prev_states, samp
 
     def sample(self, chars, chars_mask, maxlen=1000):
         K = self.n_mixtures_output
@@ -262,8 +248,8 @@ class Seq2Seq(nn.Module):
 
             dist = MixtureOfBivariateNormal(log_pi, mu, log_sigma, rho, bias=3.)
             x_t = torch.cat([
+                torch.sigmoid(-eos).bernoulli(),
                 dist.sample(),
-                torch.sigmoid(eos).bernoulli(),
             ], dim=1).unsqueeze(1)
 
         return torch.cat(strokes, 1)
@@ -271,23 +257,19 @@ class Seq2Seq(nn.Module):
 
 if __name__ == '__main__':
     vocab_size = 60
-    emb_size = 128
-    enc_hidden_size = 256
-    enc_n_layers = 1
     dec_hidden_size = 400
     dec_n_layers = 3
-    K_att = 10
+    K_att = 6
     K_out = 20
 
     model = Seq2Seq(
-        vocab_size, emb_size, enc_hidden_size, enc_n_layers,
-        dec_hidden_size, dec_n_layers,
+        vocab_size, dec_hidden_size, dec_n_layers,
         K_att, K_out
     ).cuda()
-    chars = torch.randint(0, vocab_size, (16, 50)).cuda()
+    chars = torch.randint(0, vocab_size, (4, 50)).cuda()
     chars_mask = torch.ones_like(chars).float()
-    strokes = torch.randn(16, 300, 3).cuda()
-    strokes_mask = torch.ones(16, 300).cuda()
+    strokes = torch.randn(4, 300, 3).cuda()
+    strokes_mask = torch.ones(4, 300).cuda()
 
     loss = model(strokes, strokes_mask, chars, chars_mask)
     print(loss)

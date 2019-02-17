@@ -1,81 +1,103 @@
 import numpy as np
 import torch
 from tqdm import tqdm
+from torch.utils.data import DataLoader
 from pathlib import Path
-import data.utils as utils
+from collections import Counter
+from utils import draw
 
 
-class DataLoader(object):
-    def __init__(self, base_path='./data/processed'):
-        self.vocab = utils.num_to_alpha
-        self.char2idx = utils.alpha_to_num
+def pad_and_mask_batch(batch):
+    strokes, sentences = zip(*batch)
+    stroke_lengths = [len(x) for x in strokes]
+    sentence_lengths = [len(x) for x in sentences]
+    bsz = len(batch)
 
-        root = Path(base_path)
-        self.chars = np.load(root / 'c.npy').astype('int64')
-        self.chars_lens = np.load(root / 'c_len.npy')
-        self.strokes = np.load(root / 'x.npy').astype('float32')
-        self.stroke_lens = np.load(root / 'x_len.npy')
+    stroke_arr = torch.zeros(bsz, max(stroke_lengths), 3).float()
+    stroke_mask = torch.zeros(bsz, max(stroke_lengths)).float()
 
-        self.chars_mask = np.zeros_like(self.chars).astype('float32')
-        self.strokes_mask = np.zeros(self.strokes.shape[:2]).astype('float32')
-        for i, (char_len, stk_len) in enumerate(zip(self.chars_lens, self.stroke_lens)):
-            self.chars_mask[i, :char_len] = 1.
-            self.strokes_mask[i, :stk_len] = 1.
+    sent_arr = torch.zeros(bsz, max(sentence_lengths)).long()
+    sent_mask = torch.zeros(bsz, max(sentence_lengths)).float()
 
-        idxs = list(zip(np.arange(len(self.stroke_lens)), self.stroke_lens))
-        np.random.seed(1)
-        np.random.shuffle(idxs)
+    for i, (stroke, length) in enumerate(zip(strokes, stroke_lengths)):
+        stroke_arr[i, :length] = stroke
+        stroke_mask[i, :length] = 1.
 
-        self.idxs = {}
-        # self.idxs['train'] = list(zip(*sorted(
-        #     idxs[:int(len(idxs) * .9)], key=lambda tup: tup[1]
-        # )))
-        # self.idxs['test'] = list(zip(*sorted(
-        #     idxs[int(len(idxs) * .9):], key=lambda tup: tup[1]
-        # )))
-        self.idxs['train'] = list(zip(
-            *idxs[:int(len(idxs) * .9)]
-        ))
-        self.idxs['test'] = list(zip(
-            *idxs[int(len(idxs) * .9):]
-        ))
+    for i, (sent, length) in enumerate(zip(sentences, sentence_lengths)):
+        sent_arr[i, :length] = sent
+        sent_mask[i, :length] = 1.
 
-    def sent_to_idx(self, chars):
-        return ''.join([chr(self.vocab[x]) for x in chars])
+    return sent_arr, sent_mask, stroke_arr, stroke_mask
 
-    def create_iterator(self, split='train', batch_size=64):
-        idxs, stk_lengths = [np.array(x) for x in self.idxs[split]]
-        for i in range(0, len(idxs), batch_size):
-            max_stk_len = max(stk_lengths[i:i + batch_size])
-            max_char_len = max(self.chars_lens[idxs[i:i + batch_size]])
 
-            stk = torch.from_numpy(
-                self.strokes[idxs[i:i + batch_size]][:, :max_stk_len]
-            )
-            stk_mask = torch.from_numpy(
-                self.strokes_mask[idxs[i:i + batch_size]][:, :max_stk_len]
-            )
+class HandwritingDataset(torch.utils.data.Dataset):
+    def __init__(self, path, split='train'):
+        super().__init__()
+        root = Path(path)
+        self.strokes = np.load(root / 'strokes.npy', encoding='latin1')
 
-            chars = torch.from_numpy(
-                self.chars[idxs[i:i + batch_size]][:, :max_char_len]
-            )
-            chars_mask = torch.from_numpy(
-                self.chars_mask[idxs[i:i + batch_size]][:, :max_char_len]
-            )
+        all_strokes = np.concatenate(self.strokes, 0)
+        self.mean = all_strokes[:, 1:].mean(0, keepdims=True)
+        self.std = all_strokes[:, 1:].std(0, keepdims=True)
 
-            lengths, idx = torch.sort(chars_mask.sum(-1), 0, descending=True)
-            stk = stk[idx].cuda()
-            stk_mask = stk_mask[idx].cuda()
-            chars = chars[idx].cuda()
-            chars_mask = chars_mask[idx].cuda()
+        for i in range(len(self.strokes)):
+            self.strokes[i][:, 1:] = (self.strokes[i][:, 1:] - self.mean) / self.std
 
-            yield chars, chars_mask, stk, stk_mask
+        self.sentences = open(root / 'sentences.txt').read().splitlines()
+        self.sentences = [list(x) for x in self.sentences]
+
+        ctr = Counter()
+        for line in self.sentences:
+            ctr.update(line)
+
+        self.vocab = sorted(list(ctr.keys()))
+        self.vocab_size = len(self.vocab)
+        self.char2idx = {x: i for i, x in enumerate(self.vocab)}
+        self.max_stroke_len = 600
+
+        if split == 'train':
+            self.strokes = self.strokes[:-500]
+            self.sentences = self.sentences[:-500]
+        else:
+            self.strokes = self.strokes[-500:]
+            self.sentences = self.sentences[-500:]
+
+    def __len__(self):
+        return self.strokes.shape[0]
+
+    def sent2idx(self, sent):
+        return np.asarray([self.char2idx[c] for c in sent])
+
+    def idx2sent(self, sent):
+        return ''.join(self.vocab[i] for i in sent)
+
+    def __getitem__(self, idx):
+        stroke = self.strokes[idx][:self.max_stroke_len]
+        stroke = torch.from_numpy(stroke).clamp(-50, 50)
+        # stroke[:, 1:] /= 10.
+
+        sentence = torch.from_numpy(
+            self.sent2idx(self.sentences[idx])
+        ).long()
+        return stroke, sentence
 
 
 if __name__ == '__main__':
-    dataset = DataLoader()
-    itr = dataset.create_iterator('train', batch_size=16)
-    for i, data in tqdm(enumerate(itr)):
+    path = '/Tmp/kumarrit/iam_ondb'
+    dataset = HandwritingDataset('./lyrebird_data')
+    loader = DataLoader(dataset, batch_size=16, collate_fn=pad_and_mask_batch)
+    for i, data in tqdm(enumerate(loader)):
+        data = [x.cuda() for x in data]
+        (sent, sent_mask, stk, stk_mask) = data
         if i == 0:
-            for x in data[1:]:
-                print(x.shape)
+            print(stk.shape)
+            print(stk_mask.shape)
+            print(sent.shape)
+            print(sent_mask.shape)
+
+            import ipdb; ipdb.set_trace()
+
+            for i in range(16):
+                print(dataset.idx2sent(sent[i].tolist()))
+                draw(stk[i].cpu().numpy(), dataset.mean, dataset.std, save_file='test.png')
+                input()
