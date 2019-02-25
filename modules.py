@@ -116,8 +116,8 @@ class RNNDecoder(nn.Module):
     ):
         super().__init__()
         self.lstm_0 = nn.LSTMCell(3 + enc_size, hidden_size)
-        self.lstm_1 = nn.LSTMCell(3 + enc_size + hidden_size, hidden_size)
-        self.lstm_2 = nn.LSTMCell(3 + enc_size + hidden_size, hidden_size)
+        self.lstm_1 = nn.LSTM(3 + enc_size + hidden_size, hidden_size, batch_first=True)
+        self.lstm_2 = nn.LSTM(3 + enc_size + hidden_size, hidden_size, batch_first=True)
         self.attention = GaussianAttention(hidden_size, n_mixtures_attention)
         self.fc = nn.Linear(
             hidden_size * 3, n_mixtures_output * 6 + 1
@@ -128,8 +128,9 @@ class RNNDecoder(nn.Module):
         self.n_mixtures_attention = n_mixtures_attention
 
     def __init__hidden(self, bsz):
-        hiddens = torch.zeros(3, bsz, self.hidden_size * 2).float().cuda()
-        hiddens = [hiddens[i].chunk(2, dim=-1) for i in range(3)]
+        hid_0 = torch.zeros(bsz, self.hidden_size * 2).float().cuda()
+        hid_0 = hid_0.chunk(2, dim=-1)
+        hiddens = (hid_0, None, None)
         w_0 = torch.zeros(bsz, self.enc_size).float().cuda()
         k_0 = torch.zeros(bsz, 1).float().cuda()
         return hiddens, w_0, k_0
@@ -153,25 +154,28 @@ class RNNDecoder(nn.Module):
             w_t, stats = self.attention(hid_0[0], k_t, context, context_mask)
             k_t = stats['kappa']
 
-            hid_1 = self.lstm_1(
-                torch.cat([x_t, hid_0[0], w_t], 1),
-                hid_1
-            )
-
-            hid_2 = self.lstm_2(
-                torch.cat([x_t, hid_1[0], w_t], 1),
-                hid_2
-            )
-
-            out = self.fc(
-                torch.cat([hid_0[0], hid_1[0], hid_2[0]], -1)
-            )
-
-            outputs.append(out)
+            outputs.append([hid_0[0], w_t])
             append_dict(monitor, stats)
 
+        hid_0_arr, w_t_arr = zip(*outputs)
+        hid_0_arr = torch.stack(hid_0_arr, 1)
+        w_t_arr = torch.stack(w_t_arr, 1)
+        hid_1_arr, hid_1 = self.lstm_1(
+            torch.cat([strokes, hid_0_arr, w_t_arr], -1),
+            hid_1
+        )
+
+        hid_2_arr, hid_2 = self.lstm_2(
+            torch.cat([strokes, hid_1_arr, w_t_arr], -1),
+            hid_2
+        )
+
+        outputs = self.fc(
+            torch.cat([hid_0_arr, hid_1_arr, hid_2_arr], -1)
+        )
+
         monitor = {x: torch.stack(y, 1) for x, y in monitor.items()}
-        return torch.stack(outputs, 1), monitor, ([hid_0, hid_1, hid_2], w_t, k_t)
+        return outputs, monitor, ([hid_0, hid_1, hid_2], w_t, k_t)
 
 
 class Seq2Seq(nn.Module):
