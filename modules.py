@@ -231,12 +231,21 @@ class Seq2Seq(nn.Module):
         K = self.n_mixtures_output
 
         ctx = self.enc(chars, chars_mask) * chars_mask.unsqueeze(-1)
+        max_char_idx = (chars_mask.sum(-1) - 1).long()
+        # print(max_char_idx)
+        # print(chars.shape)
+        # input()
+        prev_max = None
+
         x_t = torch.zeros(ctx.size(0), 1, 3).float().cuda()
         prev_states = None
         strokes = []
         for i in range(maxlen):
             strokes.append(x_t)
-            out, _, prev_states = self.dec(x_t, ctx, chars_mask, prev_states)
+            out, monitor, prev_states = self.dec(x_t, ctx, chars_mask, prev_states)
+            phi = monitor['phi'].squeeze(1)
+            is_incomplete = 1 - torch.gt(phi.max(1)[1], max_char_idx).float()
+            # print(phi.max(1)[1].item())
 
             mu, log_sigma, pi, rho, eos = out.squeeze(1).split(
                 [2 * K, 2 * K, K, K, 1], dim=-1
@@ -250,7 +259,11 @@ class Seq2Seq(nn.Module):
             x_t = torch.cat([
                 torch.sigmoid(-eos).bernoulli(),
                 dist.sample(),
-            ], dim=1).unsqueeze(1)
+                ], dim=1).unsqueeze(1) * is_incomplete[:, None, None]
+
+            if is_incomplete.sum().item() == 0 or phi.sum().item() == 0:
+                # print('Breaking out of sampling early!')
+                break
 
         return torch.cat(strokes, 1)
 

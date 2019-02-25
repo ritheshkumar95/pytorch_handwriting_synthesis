@@ -21,7 +21,7 @@ def pad_and_mask_batch(batch):
 
     for i, (stroke, length) in enumerate(zip(strokes, stroke_lengths)):
         stroke_arr[i, :length] = stroke
-        stroke_mask[i, :length] = 1.
+        stroke_mask[i, :length + 50] = 1.
 
     for i, (sent, length) in enumerate(zip(sentences, sentence_lengths)):
         sent_arr[i, :length] = sent
@@ -36,15 +36,8 @@ class HandwritingDataset(torch.utils.data.Dataset):
         root = Path(path)
         self.strokes = np.load(root / 'strokes.npy', encoding='latin1')
 
-        all_strokes = np.concatenate(self.strokes, 0)
-        self.mean = all_strokes[:, 1:].mean(0, keepdims=True)
-        self.std = all_strokes[:, 1:].std(0, keepdims=True)
-
-        for i in range(len(self.strokes)):
-            self.strokes[i][:, 1:] = (self.strokes[i][:, 1:] - self.mean) / self.std
-
         self.sentences = open(root / 'sentences.txt').read().splitlines()
-        self.sentences = [list(x) for x in self.sentences]
+        self.sentences = [list(x + ' ') for x in self.sentences]
 
         ctr = Counter()
         for line in self.sentences:
@@ -85,6 +78,7 @@ class HandwritingDataset(torch.utils.data.Dataset):
 if __name__ == '__main__':
     path = '/Tmp/kumarrit/iam_ondb'
     dataset = HandwritingDataset('./lyrebird_data')
+    # dataset = HandwritingDataset('./data/processed')
     loader = DataLoader(dataset, batch_size=16, collate_fn=pad_and_mask_batch)
     for i, data in tqdm(enumerate(loader)):
         data = [x.cuda() for x in data]
@@ -95,9 +89,7 @@ if __name__ == '__main__':
             print(sent.shape)
             print(sent_mask.shape)
 
-            import ipdb; ipdb.set_trace()
-
             for i in range(16):
                 print(dataset.idx2sent(sent[i].tolist()))
-                draw(stk[i].cpu().numpy(), dataset.mean, dataset.std, save_file='test.png')
+                draw(stk[i].cpu().numpy(), save_file='test.png')
                 input()

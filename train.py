@@ -59,13 +59,13 @@ def plot_attention():
             writer.add_figure('attention/kappa_%d' % i, fig, steps)
 
             fig = draw(
-                out[0], train_dataset.mean, train_dataset.std, 
+                out[0],
                 save_file=root / ("generated_%d.png" % i)
             )
             writer.add_figure("samples/generated_%d" % i, fig, steps)
 
             fig = draw(
-                sample[0], train_dataset.mean, train_dataset.std,
+                sample[0],
                 save_file=root / ("teacher_forced_%d.png" % i)
             )
             writer.add_figure("samples/teacher_forced_%d" % i, fig, steps)
@@ -157,7 +157,7 @@ def parse_args():
     parser.add_argument("--n_mixtures_output", type=int, default=20)
     parser.add_argument("--mask_loss", action='store_true')
 
-    parser.add_argument("--path", default='./data/processed')
+    parser.add_argument("--path", default='./lyrebird_data')
     parser.add_argument("--batch_size", type=int, default=64)
 
     parser.add_argument("--lr", type=float, default=1e-3)
@@ -177,8 +177,8 @@ if not root.exists():
 pickle.dump(args, open(root / "args.pkl", "wb"))
 writer = SummaryWriter(str(root))
 
-train_dataset = HandwritingDataset('./lyrebird_data', split='train')
-test_dataset = HandwritingDataset('./lyrebird_data', split='test')
+train_dataset = HandwritingDataset(args.path, split='train')
+test_dataset = HandwritingDataset(args.path, split='test')
 train_loader = DataLoader(
     train_dataset,
     batch_size=args.batch_size,
@@ -202,7 +202,7 @@ model = Seq2Seq(
 ).cuda()
 print(model)
 
-opt = torch.optim.Adam(model.parameters(), lr=args.lr)
+opt = torch.optim.Adam(model.parameters(), lr=args.lr, amsgrad=True)
 
 if load_root and load_root.exists():
     model.load_state_dict(torch.load(load_root / 'model.pt'))
@@ -215,7 +215,6 @@ for i in range(8):
     data = itr.__next__()
     fig = draw(
         data[2][0].numpy(),
-        train_dataset.mean, train_dataset.std,
         save_file=root / ("original_%d.png" % i)
     )
     writer.add_figure("samples/original_%d" % i, fig, 0)
