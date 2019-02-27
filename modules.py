@@ -2,72 +2,73 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
-from torch.distributions.distribution import Distribution
+from utils import concatenate_dict
 
 
-def append_dict(main_dict, new_dict):
-    for key in main_dict.keys():
-        main_dict[key] += [new_dict[key]]
+def mixture_of_bivariate_normal_nll(
+    data, log_pi, mu, log_sigma, rho, eps=1e-6
+):
+    x, y = data.unsqueeze(-2).unbind(-1)
+    mu_1, mu_2 = mu.unbind(-1)
+
+    log_sigma_1, log_sigma_2 = log_sigma.unbind(-1)
+    sigma_1 = log_sigma_1.exp() + eps
+    sigma_2 = log_sigma_2.exp() + eps
+
+    # Compute log prob of bivariate normal distribution
+    Z = torch.pow((x - mu_1) / sigma_1, 2) + torch.pow((y - mu_2) / sigma_2, 2)
+    Z -= 2 * rho * ((x - mu_1) * (y - mu_2)) / (sigma_1 * sigma_2)
+
+    log_N = -Z / (2 * (1 - rho ** 2) + eps)
+    log_N -= np.log(2 * np.pi) + log_sigma_1 + log_sigma_2
+    log_N -= .5 * torch.log(1 - rho ** 2 + eps)
+
+    # Use log_sum_exp to accurately compute log prob of mixture distribution
+    nll = -torch.logsumexp(log_pi + log_N, dim=-1)
+    return nll
 
 
-class MixtureOfBivariateNormal(Distribution):
-    def __init__(self, log_pi, mu, log_sigma, rho, eps=1e-6, bias=0.):
-        '''
-        Mixture of bivariate normal distribution
-        Args:
-            mu, sigma - (B, T, K, 2)
-            rho - (B, T, K)
-            log_pi - (B, T, K)
-        '''
-        super().__init__()
-        self.log_pi = log_pi
-        self.mu = mu
-        self.log_sigma = log_sigma
-        self.rho = rho
+def mixture_of_bivariate_normal_sample(
+    log_pi, mu, log_sigma, rho, eps=1e-6, bias=0.
+):
+    batch_size = log_pi.shape[0]
+    ndims = log_pi.dim()
 
-        self.bias = bias
-        self.eps = eps
+    if ndims > 2:
+        # Collapse batch and seq_len dimensions
+        log_pi, mu, log_sigma, rho = [
+            x.reshape(-1, *x.shape[2:])
+            for x in [log_pi, mu, log_sigma, rho]
+        ]
 
-    def log_prob(self, x):
-        t = (x - self.mu) / (self.log_sigma.exp() + self.eps)
-        Z = (t ** 2).sum(-1) - 2 * self.rho * torch.prod(t, -1)
+    # Sample mixture index using mixture probabilities pi
+    pi = log_pi.exp() * (1 + bias)
+    mixture_idx = pi.multinomial(1).squeeze(1)
 
-        num = -Z / (2 * (1 - self.rho ** 2) + self.eps)
-        denom = np.log(2 * np.pi) + self.log_sigma.sum(-1) + .5 * torch.log(1 - self.rho ** 2 + self.eps)
-        log_N = num - denom
-        log_prob = torch.logsumexp(self.log_pi + log_N, dim=-1)
-        return -log_prob
+    # Index the correct mixture for mu, log_sigma and rho
+    mu, log_sigma, rho = [
+        x[torch.arange(mixture_idx.shape[0]), mixture_idx]
+        for x in [mu, log_sigma, rho]
+    ]
 
-    def sample(self):
-        flag = False
-        if self.log_pi.dim() == 3:
-            B, T, N = self.log_pi.shape
-            flag = True
-            self.log_pi = self.log_pi.view(-1, N)
-            self.mu = self.mu.contiguous().view(-1, N, 2)
-            self.log_sigma = self.log_sigma.contiguous().view(-1, N, 2)
-            self.rho = self.rho.contiguous().view(-1, N)
+    # Calculate biased variances
+    sigma = (log_sigma - bias).exp()
 
-        index = (
-            self.log_pi.exp() * (1 + self.bias)
-        ).multinomial(1).squeeze(1)
-        mu = self.mu[torch.arange(index.shape[0]), index]
-        sigma = (self.log_sigma - self.bias).exp()[torch.arange(index.shape[0]), index]
-        rho = self.rho[torch.arange(index.shape[0]), index]
+    # Sample from the bivariate normal distribution
+    mu_1, mu_2 = mu.unbind(-1)
+    sigma_1, sigma_2 = sigma.unbind(-1)
+    z_1 = torch.randn_like(mu_1)
+    z_2 = torch.randn_like(mu_2)
 
-        mu1, mu2 = mu.unbind(-1)
-        sigma1, sigma2 = sigma.unbind(-1)
-        z1 = torch.randn_like(mu1)
-        z2 = torch.randn_like(mu2)
+    x = mu_1 + sigma_1 * z_1
+    y = mu_2 + sigma_2 * (z_2 * ((1 - rho ** 2) ** .5) + z_1 * rho)
 
-        x1 = mu1 + sigma1 * z1
-        mult = z2 * ((1 - rho ** 2) ** .5) + z1 * rho
-        x2 = mu2 + sigma2 * mult
-        out = torch.stack([x1, x2], 1)
-        if flag:
-            out = out.view(B, T, 2)
-        return out
+    # Uncollapse the matrix to a tensor (if necessary)
+    sample = torch.stack([x, y], 1)
+    if sample.shape[0] != batch_size:
+        sample = sample.view(batch_size, -1, 2)
+
+    return sample
 
 
 class OneHotEncoder(nn.Module):
@@ -79,7 +80,7 @@ class OneHotEncoder(nn.Module):
         shp = arr.size() + (self.vocab_size,)
         one_hot_arr = torch.zeros(shp).float().cuda()
         one_hot_arr.scatter_(-1, arr.unsqueeze(-1), 1)
-        return one_hot_arr
+        return one_hot_arr * mask.unsqueeze(-1)
 
 
 class GaussianAttention(nn.Module):
@@ -99,197 +100,213 @@ class GaussianAttention(nn.Module):
         u = u[None, :, None].repeat(B, 1, 1)  # (B, T, 1)
         phi = alpha * torch.exp(-beta * torch.pow(kappa - u, 2))  # (B, T, K)
         phi = phi.sum(-1) * ctx_mask
+        w = (phi.unsqueeze(-1) * ctx).sum(1)
 
-        monitor = {
+        attention_vars = {
             'alpha': alpha.squeeze(1),
             'beta': beta.squeeze(1),
             'kappa': kappa.squeeze(1),
             'phi': phi,
         }
-        return (phi.unsqueeze(-1) * ctx).sum(1), monitor
+        return w, attention_vars
 
 
-class RNNDecoder(nn.Module):
+class HandwritingSynthesisNetwork(nn.Module):
     def __init__(
-        self, enc_size, hidden_size, n_layers,
+        self, vocab_size, hidden_size, n_layers,
         n_mixtures_attention, n_mixtures_output
     ):
         super().__init__()
-        self.lstm_0 = nn.LSTMCell(3 + enc_size, hidden_size)
-        self.lstm_1 = nn.LSTM(3 + enc_size + hidden_size, hidden_size, batch_first=True)
-        self.lstm_2 = nn.LSTM(3 + enc_size + hidden_size, hidden_size, batch_first=True)
+        self.encoder = OneHotEncoder(vocab_size)
+        self.lstm_0 = nn.LSTMCell(3 + vocab_size, hidden_size)
+        self.lstm_1 = nn.LSTM(3 + vocab_size + hidden_size, hidden_size, batch_first=True)
+        self.lstm_2 = nn.LSTM(3 + vocab_size + hidden_size, hidden_size, batch_first=True)
         self.attention = GaussianAttention(hidden_size, n_mixtures_attention)
         self.fc = nn.Linear(
             hidden_size * 3, n_mixtures_output * 6 + 1
         )
 
         self.hidden_size = hidden_size
-        self.enc_size = enc_size
-        self.n_mixtures_attention = n_mixtures_attention
+        self.vocab_size = vocab_size
+        self.n_mixtures_output = n_mixtures_output
 
     def __init__hidden(self, bsz):
         hid_0 = torch.zeros(bsz, self.hidden_size * 2).float().cuda()
         hid_0 = hid_0.chunk(2, dim=-1)
-        hiddens = (hid_0, None, None)
-        w_0 = torch.zeros(bsz, self.enc_size).float().cuda()
+        hid_1, hid_2 = None, None
+        w_0 = torch.zeros(bsz, self.vocab_size).float().cuda()
         k_0 = torch.zeros(bsz, 1).float().cuda()
-        return hiddens, w_0, k_0
+        return hid_0, hid_1, hid_2, w_0, k_0
 
-    def forward(self, strokes, context, context_mask, prev_states=None):
-        bsz = strokes.size(0)
+    def __parse_outputs(self, out):
+        K = self.n_mixtures_output
+        mu, log_sigma, pi, rho, eos = out.split([2 * K, 2 * K, K, K, 1], -1)
+
+        # Apply activations to constrain values in the correct range
+        rho = torch.tanh(rho)
+        log_pi = F.log_softmax(pi, dim=-1)
+        eos = torch.sigmoid(-eos)
+
+        mu = mu.view(mu.shape[:-1] + (K, 2))
+        log_sigma = log_sigma.view(log_sigma.shape[:-1] + (K, 2))
+
+        return log_pi, mu, log_sigma, rho, eos
+
+    def forward(self, chars, chars_mask, strokes, strokes_mask, prev_states=None):
+        # Encode the characters
+        chars = self.encoder(chars, chars_mask)
 
         if prev_states is None:
-            [hid_0, hid_1, hid_2], w_t, k_t = self.__init__hidden(bsz)
+            hid_0, hid_1, hid_2, w_t, k_t = self.__init__hidden(chars.size(0))
         else:
-            [hid_0, hid_1, hid_2], w_t, k_t = prev_states
+            hid_0, hid_1, hid_2, w_t, k_t = prev_states
 
-        outputs = []
-        monitor = {'phi': [], 'kappa': [], 'alpha': [], 'beta': []}
+        lstm_0_out = []
+        attention_out = []
+        monitor_vars = {'phi': [], 'alpha': [], 'beta': [], 'kappa': []}
+
         for x_t in strokes.unbind(1):
             hid_0 = self.lstm_0(
-                torch.cat([x_t, w_t], 1),
+                torch.cat([x_t, w_t], -1),
                 hid_0
             )
 
-            w_t, stats = self.attention(hid_0[0], k_t, context, context_mask)
-            k_t = stats['kappa']
+            w_t, vars_t = self.attention(hid_0[0], k_t, chars, chars_mask)
+            k_t = vars_t['kappa']
 
-            outputs.append([hid_0[0], w_t])
-            append_dict(monitor, stats)
+            concatenate_dict(monitor_vars, vars_t)
+            lstm_0_out.append(hid_0[0])
+            attention_out.append(w_t)
 
-        hid_0_arr, w_t_arr = zip(*outputs)
-        hid_0_arr = torch.stack(hid_0_arr, 1)
-        w_t_arr = torch.stack(w_t_arr, 1)
-        hid_1_arr, hid_1 = self.lstm_1(
-            torch.cat([strokes, hid_0_arr, w_t_arr], -1),
+        lstm_0_out = torch.stack(lstm_0_out, 1)
+        attention_out = torch.stack(attention_out, 1)
+
+        lstm_1_out, hid_1 = self.lstm_1(
+            torch.cat([strokes, attention_out, lstm_0_out], -1),
             hid_1
         )
 
-        hid_2_arr, hid_2 = self.lstm_2(
-            torch.cat([strokes, hid_1_arr, w_t_arr], -1),
+        lstm_2_out, hid_2 = self.lstm_2(
+            torch.cat([strokes, attention_out, lstm_1_out], -1),
             hid_2
         )
 
-        outputs = self.fc(
-            torch.cat([hid_0_arr, hid_1_arr, hid_2_arr], -1)
+        last_out = self.fc(
+            torch.cat([lstm_0_out, lstm_1_out, lstm_2_out], -1)
         )
 
-        monitor = {x: torch.stack(y, 1) for x, y in monitor.items()}
-        return outputs, monitor, ([hid_0, hid_1, hid_2], w_t, k_t)
-
-
-class Seq2Seq(nn.Module):
-    def __init__(
-        self, vocab_size, dec_hidden_size, dec_n_layers,
-        n_mixtures_attention, n_mixtures_output
-    ):
-        super().__init__()
-        self.enc = OneHotEncoder(vocab_size)
-        self.dec = RNNDecoder(
-            vocab_size, dec_hidden_size, dec_n_layers,
-            n_mixtures_attention, n_mixtures_output
-        )
-        self.n_mixtures_attention = n_mixtures_attention
-        self.n_mixtures_output = n_mixtures_output
-
-        # for name, param in self.named_parameters():
-        #     if 'weight' in name:
-        #         torch.nn.init.xavier_normal_(param)
-        #     elif 'phi' in name:
-        #             torch.nn.init.constant_(param, -2.)
-
-    def forward(self, strokes, strokes_mask, chars, chars_mask, prev_states=None, mask_loss=True):
-        K = self.n_mixtures_output
-
-        ctx = self.enc(chars, chars_mask) * chars_mask.unsqueeze(-1)
-        out, att, prev_states = self.dec(strokes[:, :-1], ctx, chars_mask, prev_states)
-
-        mu, log_sigma, pi, rho, eos = out.split([2 * K, 2 * K, K, K, 1], -1)
-        rho = torch.tanh(rho)
-        log_pi = F.log_softmax(pi, dim=-1)
-
-        mu = mu.view(mu.shape[:2] + (K, 2))  # (B, T, K, 2)
-        log_sigma = log_sigma.view(log_sigma.shape[:2] + (K, 2))  # (B, T, K, 2)
-
-        dist = MixtureOfBivariateNormal(log_pi, mu, log_sigma, rho)
-
-        stroke_loss = dist.log_prob(strokes[:, 1:, 1:].unsqueeze(-2))
-        eos_loss = F.binary_cross_entropy_with_logits(
-            -eos.squeeze(-1), strokes[:, 1:, 0], reduction='none'
-        )
-
-        samp = torch.cat([
-            torch.sigmoid(-eos).bernoulli(),
-            dist.sample(),
-        ], dim=-1)
-
-        if mask_loss:
-            mask = strokes_mask[:, 1:]
-            stroke_loss = (stroke_loss * mask).sum(-1).mean()
-            eos_loss = (eos_loss * mask).sum(-1).mean()
-            return stroke_loss, eos_loss, att, prev_states, samp
-        else:
-            return stroke_loss.mean(), eos_loss.mean(), att, prev_states, samp
+        output_params = self.__parse_outputs(last_out)
+        monitor_vars = {x: torch.stack(y, 1) for x, y in monitor_vars.items()}
+        return output_params, monitor_vars, (hid_0, hid_1, hid_2, w_t, k_t)
 
     def sample(self, chars, chars_mask, maxlen=1000):
-        K = self.n_mixtures_output
+        chars = self.encoder(chars, chars_mask)
+        last_idx = (chars_mask.sum(-1) - 1).long()
 
-        ctx = self.enc(chars, chars_mask) * chars_mask.unsqueeze(-1)
-        max_char_idx = (chars_mask.sum(-1) - 1).long()
-        # print(max_char_idx)
-        # print(chars.shape)
-        # input()
-        prev_max = None
+        hid_0, hid_1, hid_2, w_t, k_t = self.__init__hidden(chars.size(0))
+        x_t = torch.zeros(chars.size(0), 3).float().cuda()
 
-        x_t = torch.zeros(ctx.size(0), 1, 3).float().cuda()
-        prev_states = None
         strokes = []
+        monitor_vars = {'phi': [], 'kappa': [], 'alpha': [], 'beta': []}
         for i in range(maxlen):
-            strokes.append(x_t)
-            out, monitor, prev_states = self.dec(x_t, ctx, chars_mask, prev_states)
-            phi = monitor['phi'].squeeze(1)
-            is_incomplete = 1 - torch.gt(phi.max(1)[1], max_char_idx).float()
-            # print(phi.max(1)[1].item())
-
-            mu, log_sigma, pi, rho, eos = out.squeeze(1).split(
-                [2 * K, 2 * K, K, K, 1], dim=-1
+            hid_0 = self.lstm_0(
+                torch.cat([x_t, w_t], -1),
+                hid_0
             )
-            rho = torch.tanh(rho)
-            log_pi = F.log_softmax(pi, dim=-1)
-            mu = mu.view(-1, K, 2)  # (B, K, 2)
-            log_sigma = log_sigma.view(-1, K, 2)  # (B, K, 2)
 
-            dist = MixtureOfBivariateNormal(log_pi, mu, log_sigma, rho, bias=3.)
+            w_t, vars_t = self.attention(hid_0[0], k_t, chars, chars_mask)
+            k_t = vars_t['kappa']
+
+            concatenate_dict(monitor_vars, vars_t)
+
+            _, hid_1 = self.lstm_1(
+                torch.cat([x_t, w_t, hid_0[0]], 1).unsqueeze(1),
+                hid_1
+            )  # hid_1 - tuple of (1, batch_size, hidden_size)
+
+            _, hid_2 = self.lstm_2(
+                torch.cat([x_t, w_t, hid_1[0].squeeze(0)], 1).unsqueeze(1),
+                hid_2
+            )  # hid_2 - tuple of (1, batch_size, hidden_size)
+
+            last_out = self.fc(
+                torch.cat([hid_0[0], hid_1[0].squeeze(0), hid_2[0].squeeze(0)], 1)
+            )
+            output_params = self.__parse_outputs(last_out)
+
             x_t = torch.cat([
-                torch.sigmoid(-eos).bernoulli(),
-                dist.sample(),
-                ], dim=1).unsqueeze(1) * is_incomplete[:, None, None]
+                output_params[-1].bernoulli(),
+                mixture_of_bivariate_normal_sample(*output_params[:-1], bias=3.)
+            ], dim=1)
 
-            if is_incomplete.sum().item() == 0 or phi.sum().item() == 0:
-                # print('Breaking out of sampling early!')
+            ################################################
+            # Exit Condition                               #
+            ################################################
+            phi_t = vars_t['kappa']
+            check_1 = ~torch.gt(phi_t.max(1)[1], last_idx)
+            check_2 = torch.sign(phi_t.sum(1)).byte()
+            is_incomplete = check_1 | check_2
+
+            if is_incomplete.sum().item() == 0:
                 break
 
-        return torch.cat(strokes, 1)
+            x_t = x_t * is_incomplete.float().unsqueeze(-1)
+            strokes.append(x_t)
+
+        monitor_vars = {x: torch.stack(y, 1) for x, y in monitor_vars.items()}
+        return torch.stack(strokes, 1), monitor_vars
+
+    def compute_loss(self, chars, chars_mask, strokes, strokes_mask, prev_states=None):
+        input_strokes = strokes[:, :-1]
+        input_strokes_mask = strokes_mask[:, :-1]
+        output_strokes = strokes[:, 1:]
+
+        output_params, monitor_vars, prev_states = self.forward(
+            chars, chars_mask, input_strokes, input_strokes_mask,
+            prev_states
+        )
+
+        stroke_loss = mixture_of_bivariate_normal_nll(
+            output_strokes[:, :, 1:],
+            *output_params[:-1]  # passing everything except eos param
+        )
+        stroke_loss = (stroke_loss * input_strokes_mask).sum(-1).mean()
+
+        eos_loss = F.binary_cross_entropy(
+            output_params[-1].squeeze(-1),
+            output_strokes[:, :, 0],
+            reduction='none'
+        )
+        eos_loss = (eos_loss * input_strokes_mask).sum(-1).mean()
+
+        teacher_forced_sample = torch.cat([
+            output_params[-1].bernoulli(),
+            mixture_of_bivariate_normal_sample(*output_params[:-1], bias=3.)
+        ], dim=-1)
+
+        return stroke_loss, eos_loss, monitor_vars, prev_states, teacher_forced_sample
 
 
 if __name__ == '__main__':
     vocab_size = 60
-    dec_hidden_size = 400
-    dec_n_layers = 3
+    hidden_size = 400
+    n_layers = 3
     K_att = 6
     K_out = 20
 
-    model = Seq2Seq(
-        vocab_size, dec_hidden_size, dec_n_layers,
+    model = HandwritingSynthesisNetwork(
+        vocab_size, hidden_size, n_layers,
         K_att, K_out
     ).cuda()
+
     chars = torch.randint(0, vocab_size, (4, 50)).cuda()
     chars_mask = torch.ones_like(chars).float()
+
     strokes = torch.randn(4, 300, 3).cuda()
     strokes_mask = torch.ones(4, 300).cuda()
 
-    loss = model(strokes, strokes_mask, chars, chars_mask)
+    loss = model.compute_loss(chars, chars_mask, strokes, strokes_mask)
     print(loss)
 
     out = model.sample(chars, chars_mask)
-    print(out.shape)
+    print(out[0].shape)

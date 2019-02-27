@@ -46,7 +46,6 @@ class HandwritingDataset(torch.utils.data.Dataset):
         self.vocab = sorted(list(ctr.keys()))
         self.vocab_size = len(self.vocab)
         self.char2idx = {x: i for i, x in enumerate(self.vocab)}
-        self.max_stroke_len = 600
 
         if split == 'train':
             self.strokes = self.strokes[:-500]
@@ -65,7 +64,7 @@ class HandwritingDataset(torch.utils.data.Dataset):
         return ''.join(self.vocab[i] for i in sent)
 
     def __getitem__(self, idx):
-        stroke = self.strokes[idx][:self.max_stroke_len]
+        stroke = self.strokes[idx]
         stroke = torch.from_numpy(stroke).clamp(-50, 50)
         # stroke[:, 1:] /= 10.
 
@@ -78,7 +77,6 @@ class HandwritingDataset(torch.utils.data.Dataset):
 if __name__ == '__main__':
     path = '/Tmp/kumarrit/iam_ondb'
     dataset = HandwritingDataset('./lyrebird_data')
-    # dataset = HandwritingDataset('./data/processed')
     loader = DataLoader(dataset, batch_size=16, collate_fn=pad_and_mask_batch)
     for i, data in tqdm(enumerate(loader)):
         data = [x.cuda() for x in data]
