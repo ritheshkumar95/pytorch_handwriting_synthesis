@@ -35,7 +35,6 @@ class HandwritingDataset(torch.utils.data.Dataset):
         super().__init__()
         root = Path(path)
         self.strokes = np.load(root / 'strokes.npy', encoding='latin1')
-
         self.sentences = open(root / 'sentences.txt').read().splitlines()
         self.sentences = [list(x + ' ') for x in self.sentences]
 
@@ -76,7 +75,7 @@ class HandwritingDataset(torch.utils.data.Dataset):
 
 if __name__ == '__main__':
     path = '/Tmp/kumarrit/iam_ondb'
-    dataset = HandwritingDataset('./lyrebird_data')
+    dataset = HandwritingDataset('./data/processed')
     loader = DataLoader(dataset, batch_size=16, collate_fn=pad_and_mask_batch)
     for i, data in tqdm(enumerate(loader)):
         data = [x.cuda() for x in data]

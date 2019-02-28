@@ -25,8 +25,6 @@ def plot_lines(arr):
 
 
 def draw(offsets, ascii_seq=None, save_file=None):
-    # offsets[:, 1:] *= 10
-    # offsets[:, 1:] = offsets[:, 1:] * std + mean
     strokes = np.concatenate(
         [offsets[:, 0:1], np.cumsum(offsets[:, 1:], axis=0)],
         axis=1

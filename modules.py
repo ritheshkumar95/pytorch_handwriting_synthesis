@@ -65,7 +65,7 @@ def mixture_of_bivariate_normal_sample(
 
     # Uncollapse the matrix to a tensor (if necessary)
     sample = torch.stack([x, y], 1)
-    if sample.shape[0] != batch_size:
+    if ndims > 2:
         sample = sample.view(batch_size, -1, 2)
 
     return sample
@@ -84,17 +84,19 @@ class OneHotEncoder(nn.Module):
 
 
 class GaussianAttention(nn.Module):
-    def __init__(self, hidden_size, n_mixtures):
+    def __init__(self, hidden_size, n_mixtures, attention_multiplier=.05):
         super().__init__()
-        self.n_mixtures = n_mixtures
         self.linear = nn.Linear(hidden_size, 3 * n_mixtures)
+
+        self.n_mixtures = n_mixtures
+        self.attention_multiplier = attention_multiplier
 
     def forward(self, h_t, k_tm1, ctx, ctx_mask):
         B, T, _ = ctx.shape
         device = ctx.device
 
         alpha, beta, kappa = torch.exp(self.linear(h_t))[:, None].chunk(3, dim=-1)  # (B, 1, K) each
-        kappa = kappa + k_tm1.unsqueeze(1)
+        kappa = kappa * self.attention_multiplier + k_tm1.unsqueeze(1)
 
         u = torch.arange(T, dtype=torch.float32).to(device)
         u = u[None, :, None].repeat(B, 1, 1)  # (B, T, 1)
@@ -201,7 +203,7 @@ class HandwritingSynthesisNetwork(nn.Module):
 
     def sample(self, chars, chars_mask, maxlen=1000):
         chars = self.encoder(chars, chars_mask)
-        last_idx = (chars_mask.sum(-1) - 1).long()
+        last_idx = (chars_mask.sum(-1) - 2).long()
 
         hid_0, hid_1, hid_2, w_t, k_t = self.__init__hidden(chars.size(0))
         x_t = torch.zeros(chars.size(0), 3).float().cuda()
@@ -285,6 +287,125 @@ class HandwritingSynthesisNetwork(nn.Module):
         ], dim=-1)
 
         return stroke_loss, eos_loss, monitor_vars, prev_states, teacher_forced_sample
+
+
+class HandwritingPredictionNetwork(nn.Module):
+    def __init__(
+        self, hidden_size, n_layers, n_mixtures_output
+    ):
+        super().__init__()
+        self.lstm_0 = nn.LSTM(3, hidden_size, batch_first=True)
+        self.lstm_1 = nn.LSTM(3 + hidden_size, hidden_size, batch_first=True)
+        self.lstm_2 = nn.LSTM(3 + hidden_size, hidden_size, batch_first=True)
+        self.fc = nn.Linear(
+            hidden_size * 3, n_mixtures_output * 6 + 1
+        )
+
+        self.hidden_size = hidden_size
+        self.n_mixtures_output = n_mixtures_output
+
+    def __parse_outputs(self, out):
+        K = self.n_mixtures_output
+        mu, log_sigma, pi, rho, eos = out.split([2 * K, 2 * K, K, K, 1], -1)
+
+        # Apply activations to constrain values in the correct range
+        rho = torch.tanh(rho)
+        log_pi = F.log_softmax(pi, dim=-1)
+        eos = torch.sigmoid(-eos)
+
+        mu = mu.view(mu.shape[:-1] + (K, 2))
+        log_sigma = log_sigma.view(log_sigma.shape[:-1] + (K, 2))
+
+        return log_pi, mu, log_sigma, rho, eos
+
+    def forward(self, strokes, strokes_mask, prev_states=None):
+        if prev_states is None:
+            hid_0, hid_1, hid_2 = None, None, None
+        else:
+            hid_0, hid_1, hid_2 = prev_states
+
+        lstm_0_out, hid_0 = self.lstm_0(
+            strokes, hid_0
+        )
+
+        lstm_1_out, hid_1 = self.lstm_1(
+            torch.cat([strokes, lstm_0_out], -1),
+            hid_1
+        )
+
+        lstm_2_out, hid_2 = self.lstm_2(
+            torch.cat([strokes, lstm_1_out], -1),
+            hid_2
+        )
+
+        last_out = self.fc(
+            torch.cat([lstm_0_out, lstm_1_out, lstm_2_out], -1)
+        )
+
+        output_params = self.__parse_outputs(last_out)
+        return output_params, (hid_0, hid_1, hid_2)
+
+    def sample(self, batch_size=1, maxlen=1000):
+        hid_0, hid_1, hid_2 = None, None, None
+        x_t = torch.zeros(batch_size, 1, 3).float().cuda()
+
+        strokes = []
+        for i in range(maxlen):
+            _, hid_0 = self.lstm_0(x_t, hid_0)
+
+            _, hid_1 = self.lstm_1(
+                torch.cat([x_t, hid_0[0]], -1),
+                hid_1
+            )  # hid_1 - tuple of (1, batch_size, hidden_size)
+
+            _, hid_2 = self.lstm_2(
+                torch.cat([x_t, hid_1[0]], -1),
+                hid_2
+            )  # hid_2 - tuple of (1, batch_size, hidden_size)
+
+            last_out = self.fc(
+                torch.cat([hid_0[0], hid_1[0], hid_2[0]], -1)
+            ).squeeze(1)
+            output_params = self.__parse_outputs(last_out)
+
+            x_t = torch.cat([
+                output_params[-1].bernoulli(),
+                mixture_of_bivariate_normal_sample(*output_params[:-1], bias=3.)
+            ], dim=1).unsqueeze(1)
+
+            strokes.append(x_t)
+
+        return torch.cat(strokes, 1)
+
+    def compute_loss(self, strokes, strokes_mask, prev_states=None):
+        input_strokes = strokes[:, :-1]
+        input_strokes_mask = strokes_mask[:, :-1]
+        output_strokes = strokes[:, 1:]
+
+        output_params, prev_states = self.forward(
+            input_strokes, input_strokes_mask,
+            prev_states
+        )
+
+        stroke_loss = mixture_of_bivariate_normal_nll(
+            output_strokes[:, :, 1:],
+            *output_params[:-1]  # passing everything except eos param
+        )
+        stroke_loss = (stroke_loss * input_strokes_mask).sum(-1).mean()
+
+        eos_loss = F.binary_cross_entropy(
+            output_params[-1].squeeze(-1),
+            output_strokes[:, :, 0],
+            reduction='none'
+        )
+        eos_loss = (eos_loss * input_strokes_mask).sum(-1).mean()
+
+        teacher_forced_sample = torch.cat([
+            output_params[-1].bernoulli(),
+            mixture_of_bivariate_normal_sample(*output_params[:-1], bias=3.)
+        ], dim=-1)
+
+        return stroke_loss, eos_loss, prev_states, teacher_forced_sample
 
 
 if __name__ == '__main__':
