@@ -2,6 +2,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.utils.rnn import pad_packed_sequence, pack_padded_sequence
 from utils import concatenate_dict
 
 
@@ -83,6 +84,38 @@ class OneHotEncoder(nn.Module):
         return one_hot_arr * mask.unsqueeze(-1)
 
 
+class BiRNNEncoder(nn.Module):
+    def __init__(self, vocab_size, emb_size, hidden_size, n_layers):
+        super().__init__()
+        self.emb = nn.Embedding(vocab_size, emb_size)
+
+        self.rnn = nn.LSTM(
+            emb_size, hidden_size, n_layers,
+            batch_first=True,
+            bidirectional=True
+        )
+
+    def sort(self, src, mask):
+        lengths, idx = torch.sort(mask.sum(-1), 0, descending=True)
+        return src[idx], lengths, idx
+
+    def unsort(self, src, idx):
+        idx = torch.argsort(idx, 0)
+        return src[idx]
+
+    def forward(self, src, mask):
+        src, lengths, idx = self.sort(src, mask)
+        # lengths = mask.sum(-1)
+
+        src = self.emb(src)
+        src = pack_padded_sequence(src, lengths, batch_first=True)
+        out, _ = self.rnn(src)
+        out = pad_packed_sequence(out, batch_first=True)[0]
+
+        out = self.unsort(out, idx)
+        return out
+
+
 class GaussianAttention(nn.Module):
     def __init__(self, hidden_size, n_mixtures, attention_multiplier=.05):
         super().__init__()
@@ -119,10 +152,11 @@ class HandwritingSynthesisNetwork(nn.Module):
         n_mixtures_attention, n_mixtures_output
     ):
         super().__init__()
-        self.encoder = OneHotEncoder(vocab_size)
-        self.lstm_0 = nn.LSTMCell(3 + vocab_size, hidden_size)
-        self.lstm_1 = nn.LSTM(3 + vocab_size + hidden_size, hidden_size, batch_first=True)
-        self.lstm_2 = nn.LSTM(3 + vocab_size + hidden_size, hidden_size, batch_first=True)
+        # self.encoder = OneHotEncoder(vocab_size)
+        self.encoder = BiRNNEncoder(vocab_size, 200, hidden_size // 2, 2)
+        self.lstm_0 = nn.LSTMCell(3 + hidden_size, hidden_size)
+        self.lstm_1 = nn.LSTM(3 + hidden_size + hidden_size, hidden_size, batch_first=True)
+        self.lstm_2 = nn.LSTM(3 + hidden_size + hidden_size, hidden_size, batch_first=True)
         self.attention = GaussianAttention(hidden_size, n_mixtures_attention)
         self.fc = nn.Linear(
             hidden_size * 3, n_mixtures_output * 6 + 1
@@ -136,7 +170,7 @@ class HandwritingSynthesisNetwork(nn.Module):
         hid_0 = torch.zeros(bsz, self.hidden_size * 2).float().cuda()
         hid_0 = hid_0.chunk(2, dim=-1)
         hid_1, hid_2 = None, None
-        w_0 = torch.zeros(bsz, self.vocab_size).float().cuda()
+        w_0 = torch.zeros(bsz, self.hidden_size).float().cuda()
         k_0 = torch.zeros(bsz, 1).float().cuda()
         return hid_0, hid_1, hid_2, w_0, k_0
 
@@ -408,6 +442,196 @@ class HandwritingPredictionNetwork(nn.Module):
         return stroke_loss, eos_loss, prev_states, teacher_forced_sample
 
 
+class Aligner(nn.Module):
+    def __init__(
+        self, vocab_size, hidden_size, n_mixtures_attention
+    ):
+        super().__init__()
+        self.encoder = BiRNNEncoder(vocab_size, 200, hidden_size // 2, 2)
+        self.lstm_0 = nn.LSTMCell(hidden_size, hidden_size)
+        self.attention = GaussianAttention(hidden_size, n_mixtures_attention)
+
+        self.hidden_size = hidden_size
+        self.vocab_size = vocab_size
+
+    def __init__hidden(self, bsz):
+        hid_0 = torch.zeros(bsz, self.hidden_size * 2).float().cuda()
+        hid_0 = hid_0.chunk(2, dim=-1)
+        w_0 = torch.zeros(bsz, self.hidden_size).float().cuda()
+        k_0 = torch.zeros(bsz, 1).float().cuda()
+        return hid_0, w_0, k_0
+
+    def forward(self, chars, chars_mask, T, prev_states=None):
+        # Encode the characters
+        chars = self.encoder(chars, chars_mask)
+
+        if prev_states is None:
+            hid_0, w_t, k_t = self.__init__hidden(chars.size(0))
+        else:
+            hid_0, w_t, k_t = prev_states
+
+        lstm_0_out = []
+        attention_out = []
+        monitor_vars = {'phi': [], 'alpha': [], 'beta': [], 'kappa': []}
+
+        for i in range(T):
+            hid_0 = self.lstm_0(
+                w_t,
+                hid_0
+            )
+
+            w_t, vars_t = self.attention(hid_0[0], k_t, chars, chars_mask)
+            k_t = vars_t['kappa']
+
+            concatenate_dict(monitor_vars, vars_t)
+            lstm_0_out.append(hid_0[0])
+            attention_out.append(w_t)
+
+        lstm_0_out = torch.stack(lstm_0_out, 1)
+        attention_out = torch.stack(attention_out, 1)
+
+        monitor_vars = {x: torch.stack(y, 1) for x, y in monitor_vars.items()}
+        return attention_out, monitor_vars
+
+
+class ResnetBlock(nn.Module):
+    def __init__(self, dim, dilation=1):
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.ReflectionPad1d(dilation),
+            nn.Conv1d(dim, dim, kernel_size=3, dilation=dilation),
+            nn.InstanceNorm1d(dim),
+            nn.ReLU(True),
+            nn.Conv1d(dim, dim, kernel_size=1),
+            nn.InstanceNorm1d(dim)
+        )
+
+    def forward(self, x):
+        return x + self.block(x)
+
+
+class Generator(nn.Module):
+    def __init__(
+        self, vocab_size, hidden_size, n_mixtures_attention,
+        ngf, n_downsampling, n_residual_blocks
+    ):
+        super().__init__()
+        self.aligner = Aligner(vocab_size, hidden_size, n_mixtures_attention)
+        model = [
+            nn.ReflectionPad1d(3),
+            nn.Conv1d(hidden_size, ngf, kernel_size=7, padding=0),
+            nn.InstanceNorm1d(ngf),
+            nn.ReLU(True)
+        ]
+
+        # downsample
+        for i in range(n_downsampling):
+            mult = 2 ** i
+            model += [
+                nn.Conv1d(ngf * mult, ngf * mult * 2, kernel_size=4, stride=2, padding=1),
+                nn.InstanceNorm1d(ngf * mult * 2),
+                nn.ReLU(True)
+            ]
+
+        # resnet blocks
+        mult = 2 ** n_downsampling
+        for i in range(n_residual_blocks):
+            model += [ResnetBlock(ngf * mult)]
+
+        # upsample
+        for i in range(n_downsampling):
+            mult = 2 ** (n_downsampling - i)
+            model += [
+                nn.ConvTranspose1d(
+                    ngf * mult, int(ngf * mult / 2),
+                    kernel_size=4, stride=2, padding=1
+                ),
+                nn.InstanceNorm1d(int(ngf * mult / 2)),
+                nn.ReLU(True)
+            ]
+
+        model += [
+            nn.ReflectionPad1d(3),
+            nn.Conv1d(ngf, 2, kernel_size=7, padding=0),
+            nn.Tanh()
+        ]
+        self.model = nn.Sequential(*model)
+
+    def forward(self, chars, chars_mask, T):
+        alignments, monitor_vars = self.aligner(chars, chars_mask, T)
+        return self.model(alignments.transpose(1, 2)).transpose(1, 2) * 3, monitor_vars
+
+
+class NLayerDiscriminator(nn.Module):
+    def __init__(self, input_nc, ndf, n_layers, downsampling_factor):
+        super().__init__()
+        model = nn.ModuleDict()
+
+        model["layer_0"] = nn.Sequential(
+            nn.ReflectionPad1d(7),
+            nn.Conv1d(input_nc, ndf, kernel_size=15),
+            nn.InstanceNorm1d(ndf),
+            nn.LeakyReLU(0.2, True),
+        )
+
+        nf = ndf
+        stride = downsampling_factor
+        for n in range(1, n_layers + 1):
+            nf_prev = nf
+            nf = min(nf * stride, 1024)
+            model["layer_%d" % n] = nn.Sequential(
+                nn.Conv1d(
+                    nf_prev, nf,
+                    kernel_size=stride * 2,
+                    stride=stride,
+                    padding=stride // 2
+                ),
+                nn.InstanceNorm1d(nf),
+                nn.LeakyReLU(0.2, True)
+            )
+
+        nf_prev = nf
+        nf = min(nf * 2, 1024)
+
+        model["layer_%d" % (n_layers + 1)] = nn.Sequential(
+            nn.Conv1d(nf_prev, nf, kernel_size=5, stride=1, padding=2),
+            nn.InstanceNorm1d(nf),
+            nn.LeakyReLU(0.2, True)
+        )
+
+        model["layer_%d" % (n_layers + 2)] = nn.Conv1d(nf, 1, kernel_size=5, stride=1, padding=2)
+
+        self.model = model
+
+    def forward(self, x):
+        results = []
+        for key, layer in self.model.items():
+            x = layer(x)
+            results.append(x)
+        return results
+
+
+class Discriminator(nn.Module):
+    def __init__(self, input_nc, num_D, ndf, n_layers, downsampling_factor):
+        super().__init__()
+        self.model = nn.ModuleDict()
+        for i in range(num_D):
+            self.model["disc_%d" % i] = NLayerDiscriminator(
+                input_nc, ndf, n_layers, downsampling_factor
+            )
+
+        self.downsample = nn.AvgPool1d(
+            3, stride=2, padding=1, count_include_pad=False
+        )
+
+    def forward(self, x):
+        results = []
+        for key, disc in self.model.items():
+            results.append(disc(x))
+            x = self.downsample(x)
+        return results
+
+
 if __name__ == '__main__':
     vocab_size = 60
     hidden_size = 400
@@ -415,10 +639,10 @@ if __name__ == '__main__':
     K_att = 6
     K_out = 20
 
-    model = HandwritingSynthesisNetwork(
-        vocab_size, hidden_size, n_layers,
-        K_att, K_out
-    ).cuda()
+    # model = HandwritingSynthesisNetwork(
+    #     vocab_size, hidden_size, n_layers,
+    #     K_att, K_out
+    # ).cuda()
 
     chars = torch.randint(0, vocab_size, (4, 50)).cuda()
     chars_mask = torch.ones_like(chars).float()
@@ -426,8 +650,11 @@ if __name__ == '__main__':
     strokes = torch.randn(4, 300, 3).cuda()
     strokes_mask = torch.ones(4, 300).cuda()
 
-    loss = model.compute_loss(chars, chars_mask, strokes, strokes_mask)
-    print(loss)
+    # loss = model.compute_loss(chars, chars_mask, strokes, strokes_mask)
+    # print(loss)
 
-    out = model.sample(chars, chars_mask)
-    print(out[0].shape)
+    # out = model.sample(chars, chars_mask)
+    # print(out[0].shape)
+
+    netG = Generator(vocab_size, hidden_size, K_att, 32, 4, 3).cuda()
+    print(netG(chars, chars_mask, 256).shape)
