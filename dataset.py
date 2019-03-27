@@ -38,6 +38,13 @@ class HandwritingDataset(torch.utils.data.Dataset):
         self.sentences = open(root / 'sentences.txt').read().splitlines()
         self.sentences = [list(x + ' ') for x in self.sentences]
 
+        assert len(self.strokes) == len(self.sentences), 'Dataset incorrect!'
+        np.random.seed(111)
+        idxs = np.arange(len(self.strokes))
+        np.random.shuffle(idxs)
+        self.strokes = self.strokes[idxs]
+        self.sentences = np.asarray(self.sentences)[idxs].tolist()
+
         ctr = Counter()
         for line in self.sentences:
             ctr.update(line)
@@ -64,8 +71,9 @@ class HandwritingDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, idx):
         stroke = self.strokes[idx]
-        stroke = torch.from_numpy(stroke).clamp(-50, 50)
-        # stroke[:, 1:] /= 10.
+        # stroke = torch.from_numpy(stroke).clamp(-50, 50)
+        stroke = torch.from_numpy(stroke).float()
+        stroke[:, 1:] /= 20.
 
         sentence = torch.from_numpy(
             self.sent2idx(self.sentences[idx])
