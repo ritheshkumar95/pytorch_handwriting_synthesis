@@ -22,7 +22,7 @@ def parse_args():
     parser.add_argument("--n_mixtures_output", type=int, default=20)
     parser.add_argument("--seq_len", type=int, default=3000)
 
-    parser.add_argument("--path", default='./lyrebird_data')
+    parser.add_argument("--path", default='./my_data')
     parser.add_argument("--batch_size", type=int, default=64)
 
     parser.add_argument("--lr", type=float, default=1e-3)

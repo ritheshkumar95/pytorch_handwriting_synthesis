@@ -36,7 +36,6 @@ model.load_state_dict(torch.load(root / 'model.pt'))
 
 while True:
     string = input("Enter input: ") + " "
-
     chars = torch.from_numpy(
         test_dataset.sent2idx(string)
     ).long()[None].cuda()
