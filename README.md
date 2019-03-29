@@ -10,6 +10,9 @@ python scripts/train_unconditional.py --save_path logs/unconditional
 python scripts/train_conditional.py --save_path logs/conditional --seq_len 600
 ```
 
+### Sampling
+1. Use the ipython notebook `notebooks/write.ipynb`
+
 ### Unconditional Handwriting Samples
 ![jpg](images/unconditional_1.png)
 ![jpg](images/unconditional_2.png)
