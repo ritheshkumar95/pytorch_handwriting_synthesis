@@ -44,5 +44,5 @@ while True:
     with torch.no_grad():
         out = model.sample(chars, chars_mask, maxlen=2000)[0].cpu().numpy()
 
-    draw(out[0], save_file='./generated.png')
+    draw(out[0], save_file='./generated.jpg')
     print("Generated sample...\n")
